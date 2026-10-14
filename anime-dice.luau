@@ -65,6 +65,7 @@ local R = {
 	CollectBalance = rem("PlotService", "RE", "CollectBalance"),
 	EquipBest      = rem("PlotService", "RE", "EquipBest"),
 	LevelUpSlot    = rem("PlotService", "RE", "LevelUpSlot"),
+	InteractSlot   = rem("PlotService", "RE", "InteractSlot"),
 	Rebirth        = rem("RebirthService", "RE", "Rebirth"),
 	BuyDice        = rem("DiceShopService", "RE", "BuyDice"),
 	EquipDice      = rem("DiceShopService", "RE", "EquipDice"),
@@ -80,6 +81,8 @@ local R = {
 	QuirkRoll      = rem("QuirkService", "RE", "Roll"),
 	QuirkProtect   = rem("QuirkService", "RE", "SetQuirkProtected"),
 	UnitSetLocked  = rem("UnitService", "RE", "SetLocked"),
+	UnitEquip      = rem("UnitService", "RF", "Equip"),
+	UnitUnequip    = rem("UnitService", "RF", "Unequip"),
 	GearEquip      = rem("GearService", "RE", "Equip"),
 	RebirthAddStat = rem("RebirthService", "RE", "AddStat"),
 	BoostUse       = rem("BoostService", "RE", "Use"),
@@ -132,6 +135,7 @@ local D        = mod("Framework.Features.Data.DataController")
 local BuffC    = mod("Framework.Features.Buffs.BuffController")
 local TowersCfg = mod("Framework.Features.Towers.Towers")
 local TowerRefs = mod("Framework.Features.Towers.TowerRefs")
+local PlotCfg = mod("Framework.Features.Plot.PlotConfig")
 
 if not (ER and D) then
 	warn("[ADF] core modules unavailable, aborting")
@@ -328,7 +332,7 @@ ctl(sellSec, "Slider", {
 	Default = 8, Suffix = "s",
 })
 ctl(sellSec, "Dropdown", {
-	Id = "sellChance", Text = "Sell units commoner than", Default = 1000,
+	Id = "sellChance", Text = "Sell units commoner than", Default = 10000000000,
 	Options = {
 		{ Label = "1 in 100", Value = 100 },
 		{ Label = "1 in 500", Value = 500 },
@@ -337,6 +341,10 @@ ctl(sellSec, "Dropdown", {
 		{ Label = "1 in 10,000", Value = 10000 },
 		{ Label = "1 in 100,000", Value = 100000 },
 		{ Label = "1 in 1,000,000", Value = 1000000 },
+		{ Label = "1 in 10,000,000", Value = 10000000 },
+		{ Label = "1 in 100,000,000", Value = 100000000 },
+		{ Label = "1 in 1,000,000,000", Value = 1000000000 },
+		{ Label = "1 in 10,000,000,000", Value = 10000000000 },
 	},
 })
 ctl(sellSec, "Slider", { Id = "keepTop", Text = "Always keep top", Min = 0, Max = 40, Step = 1, Default = 8 })
@@ -361,13 +369,31 @@ sellSec:Button({
 		})
 	end,
 })
+sellSec:Button({
+	Id = "unlockAll", Text = "Unlock every unit (lets sell work)", ActionText = "Unlock",
+	Callback = function()
+		local n = A.unlockAll()
+		window:Notify({
+			Title = n > 0 and ("Unlocked " .. n .. " units") or "Nothing locked",
+			Content = n > 0 and "Auto-lock paused 60s so sell can clear." or "No locked units found.",
+			Kind = n > 0 and "Success" or "Info",
+		})
+	end,
+})
 
 local plotSec = farmTab:Section({ Title = "Plot income" })
 toggle_(plotSec, { Id = "autoCollect", Text = "Auto collect balance", Default = true })
 ctl(plotSec, "Slider", { Id = "collectInterval", Text = "Collect interval", Min = 2, Max = 30, Step = 1, Default = 5, Suffix = "s" })
 toggle_(plotSec, { Id = "autoEquipBest", Text = "Auto equip best", Default = true })
-ctl(plotSec, "Slider", { Id = "equipInterval", Text = "Equip interval", Min = 5, Max = 120, Step = 5, Default = 20, Suffix = "s" })
-toggle_(plotSec, { Id = "autoLevelSlots", Text = "Auto level up plot slots", Default = true })
+ctl(plotSec, "Slider", { Id = "equipInterval", Text = "Equip interval", Min = 25, Max = 180, Step = 5, Default = 45, Suffix = "s" })
+ctl(plotSec, "Dropdown", {
+	Id = "equipMode", Text = "Equip best by", Default = "rarity",
+	Options = {
+		{ Label = "Income", Value = "income" },
+		{ Label = "Rarity", Value = "rarity" },
+	},
+})
+toggle_(plotSec, { Id = "autoLevelSlots", Text = "Auto level up plot slots", Default = false })
 ctl(plotSec, "Slider", { Id = "levelSlotInterval", Text = "Slot level interval", Min = 5, Max = 120, Step = 5, Default = 15, Suffix = "s" })
 plotSec:Button({
 	Id = "collectNow", Text = "Collect + equip now", ActionText = "Run",
@@ -714,7 +740,68 @@ function A.levelSlots()
 end
 
 function A.equipBest()
+	if C.equipMode and C.equipMode:Get() == "rarity" then return A.equipRarity() end
 	if R.EquipBest then R.EquipBest:FireServer() end
+end
+
+function A.equipRarity()
+	if not (R.UnitEquip and R.InteractSlot) then
+		if R.EquipBest then R.EquipBest:FireServer() end
+		return false
+	end
+	A.collect() -- InteractSlot replaces without collecting, so bank first
+	local rb = tonumber(pv(function() return D.Rebirth() end)) or 0
+	local sl = slots()
+	local idxs = {}
+	for i in pairs(sl) do
+		local idx = tonumber(i)
+		if idx then
+			local req = PlotCfg and PlotCfg.GetSlotRebirthRequirement
+				and tonumber(pv(PlotCfg.GetSlotRebirthRequirement, idx)) or 0
+			if rb >= (req or 0) then table.insert(idxs, idx) end
+		end
+	end
+	if #idxs == 0 then return false end
+	table.sort(idxs)
+	local units = unitEntries()
+	table.sort(units, function(a, b)
+		local ra, rbb = rarityOrder(a.cfg.rarity), rarityOrder(b.cfg.rarity)
+		if ra ~= rbb then return ra > rbb end
+		if a.income ~= b.income then return a.income > b.income end
+		return a.chance > b.chance
+	end)
+	local want, used = {}, {}
+	for _, u in ipairs(units) do
+		if #want >= #idxs then break end
+		if not used[u.key] then used[u.key] = true table.insert(want, u) end
+	end
+	-- The game's Equip/Unequip share one 0.5s server debounce, and pcall only
+	-- reports transport errors, not the server's true/false. So: clear the hand
+	-- first, wait out the debounce, then check the REAL return per slot.
+	-- InteractSlot with nothing in hand on an occupied slot PICKS IT UP, so a
+	-- failed Equip must never be followed by InteractSlot.
+	if R.UnitUnequip then pcall(R.UnitUnequip.InvokeServer, R.UnitUnequip) end
+	task.wait(0.7)
+	local changed = 0
+	for si, idx in ipairs(idxs) do
+		local u = want[si]
+		if not u then break end
+		local s = sl[tostring(idx)] or sl[idx]
+		if (typeof(s) == "table" and s.unitId or nil) == u.key then continue end
+		local okE, equipped = pcall(R.UnitEquip.InvokeServer, R.UnitEquip, u.key)
+		if not (okE and equipped) then
+			log("rarity equip: " .. tostring(u.name) .. " refused, keeping slot " .. idx)
+			break -- debounce or dead unit; retry next pass, never fire bare InteractSlot
+		end
+		task.wait(0.7) -- let the Equip commit before the slot swap
+		R.InteractSlot:FireServer(idx)
+		changed = changed + 1
+		task.wait(0.7) -- InteractSlot has its own 0.5s debounce
+		sl = slots()
+	end
+	if R.UnitUnequip then pcall(R.UnitUnequip.InvokeServer, R.UnitUnequip) end
+	if changed > 0 then log("equipped by rarity (" .. changed .. " slot(s))") end
+	return changed
 end
 
 function A.rebirthStats()
@@ -975,6 +1062,7 @@ end
 
 function A.autoLock()
 	if not R.UnitSetLocked then return 0 end
+	if os.clock() < (State.lockPausedUntil or 0) then return 0 end
 	if os.clock() - (State.lastLock or 0) < 10 then return 0 end
 	local threshold = C.sellChance:Get() or 1000
 	local plotted = plottedKeys()
@@ -990,6 +1078,22 @@ function A.autoLock()
 	local n = 0
 	for _ in pairs(map) do n = n + 1 end
 	log("locked " .. n .. " rare unit(s)")
+	return n
+end
+
+function A.unlockAll()
+	if not R.UnitSetLocked then return 0 end
+	local map = {}
+	for _, u in ipairs(unitEntries()) do
+		if u.attrs.locked then map[u.key] = false end
+	end
+	if next(map) == nil then return 0 end
+	R.UnitSetLocked:FireServer(map)
+	local n = 0
+	for _ in pairs(map) do n = n + 1 end
+	State.lastLock = os.clock()
+	State.lockPausedUntil = os.clock() + 60
+	log("unlocked " .. n .. " unit(s) - auto-lock paused 60s")
 	return n
 end
 
@@ -1283,7 +1387,12 @@ register("sell", function()
 	if #unitEntries() >= inventoryCap() - (C.reserveUnits:Get() or 20) then return 2 end
 	return C.sellInterval:Get() or 8
 end, A.sell, "autoSell")
-register("equipBest", function() return C.equipInterval:Get() or 20 end, A.equipBest, "autoEquipBest")
+register("equipBest", function()
+	if C.equipMode and C.equipMode:Get() == "rarity" then
+		return math.max(C.equipInterval:Get() or 45, 25)
+	end
+	return C.equipInterval:Get() or 20
+end, A.equipBest, "autoEquipBest")
 register("upgrades", function() return C.upgradeInterval:Get() or 3 end, A.upgrades, "autoUpgrades")
 register("quests", function() return C.questInterval:Get() or 15 end, A.quests, "autoQuests")
 register("questShop", function() return C.questInterval:Get() or 15 end, A.questShop, "autoQuestShop")
@@ -1403,4 +1512,3 @@ window:Notify({
 	Kind = "Success",
 	Duration = 6,
 })
-a
