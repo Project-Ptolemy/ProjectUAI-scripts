@@ -1,221 +1,166 @@
 --[[
-	ANIME DICE HUB  —  place 113290951185459  ("[UPD 5] Anime Dice")
-	Built with Project UAI  ·  model deepseek-v4-flash
-	Built from the decompiled server source (all Framework.Features services are
-	replicated to the client, so every remote, arg shape and server check is known).
+	ANIME DICE AUTOFARM  -  place 113290951185459 ("[UPD 8] Anime Dice")
+	Interface: Project UAI UI LIB.
 
-	Everything here is automation of the game's own API. The server is authoritative:
-	it re-rolls every rarity/grade/trait server-side, recomputes prices and holds the
-	profile. Nothing here can forge a reward — the hub just drives the normal calls
-	faster than a human can and never lets the inventory back up.
+	Remote names verified live on UPD 8 (ReplicatedStorage.Network):
+	  RollService.RF.RollDice            SellService.RF.SellInventory
+	  RollService.RE.SetAutoRoll         SellService.RE.UpdateAutoSell
+	  PlotService.RE.CollectBalance      PlotService.RE.EquipBest
+	  PlotService.RE.LevelUpSlot         RebirthService.RE.Rebirth
+	  RebirthService.RE.AddStat          Network.RE.BuyUpgrade
+	  DiceShopService.RE.BuyDice/.EquipDice
+	  QuestService.RE.Claim/.Buy         CodesService.RE.RedeemCode
+	  GradeService.RE.Roll/.SetGradeProtected
+	  TraitService.RE.Roll/.SetTraitProtected
+	  QuirkService.RE.Roll/.SetQuirkProtected
+	  UnitService.RE.SetLocked           GearService.RE.Equip
+	  BoostService.RE.Use               SpinService.RE.Use
+	  DailyRewardService.RE.Claim        GroupRewardService.RE.Claim
+	  OfflineEarningsService.RE.Claim    FusingService.RE.Fuse
+	  Towers.RF.PlayTower/.CompleteTowerFloor/.CancelTower
+	  Towers.RE.EquipBestTowerTeam/.SetAutoTower
 
-	Toggle UI: RightShift.  Panic stop: the UI "STOP ALL" button, or
-	getgenv().__ANIME_DICE_HUB.stop()
-
-	API: getgenv().__ANIME_DICE_HUB
-	  .cfg            config table (enabled flags + tunables)
-	  .stats          live counters
-	  .set(k, v)      set a config value
-	  .toggle(k)      flip an enabled flag
-	  .sellNow() .collectNow() .equipBest() .claimNow() .redeemAll()
-	  .stop()         stop everything and disconnect
+	The server stays authoritative: it re-rolls rarity/grade/trait server-side and
+	holds the profile. This script only drives the normal calls faster than a human.
 ]]
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
 local RS = game:GetService("ReplicatedStorage")
-local plr = Players.LocalPlayer
 
--- one instance only ---------------------------------------------------------
-if getgenv().__ANIME_DICE_HUB then
-	pcall(function() getgenv().__ANIME_DICE_HUB.stop() end)
-end
-local HUB_VER = "1.0"
+-- shared UI library (independent of the agent client) ------------------------
+local UI = loadstring(game:HttpGet(
+	"https://raw.githubusercontent.com/Project-Ptolemy/ProjectUAI/main/dist/uai-ui.lua"
+))()
 
-local function waitFor(parent, name, t)
-	return parent and parent:WaitForChild(name, t or 15)
-end
+local window = UI:CreateWindow({
+	Id = "anime-dice-autofarm",
+	Title = "Anime Dice Autofarm",
+	Subtitle = "Roll - sell - collect - upgrade, on autopilot",
+})
 
-local Net = waitFor(RS, "Network")
+-- remotes --------------------------------------------------------------------
+local Net = RS:WaitForChild("Network", 20)
 if not Net then
-	return warn("[ADH] no Network folder - wrong game?")
+	warn("[ADF] no Network folder - wrong game?")
+	return
 end
 
-local function rem(folder, class, name)
-	local f = waitFor(Net, folder)
-	local c = f and waitFor(f, class)
-	local r = c and waitFor(c, name)
-	if not r then warn("[ADH] missing remote: " .. folder .. "." .. class .. "." .. name) end
+local function rem(service, class, name)
+	local svc = Net:FindFirstChild(service)
+	local cls = svc and svc:FindFirstChild(class)
+	local r = cls and cls:FindFirstChild(name)
+	if not r then
+		warn("[ADF] missing remote: " .. service .. "." .. class .. "." .. name)
+	end
 	return r
 end
 
--- exact remote map (verified against the decompiled services) ----------------
 local R = {
 	Roll           = rem("RollService", "RF", "RollDice"),
 	SetAutoRoll    = rem("RollService", "RE", "SetAutoRoll"),
 	SellInventory  = rem("SellService", "RF", "SellInventory"),
 	SellEquipped   = rem("SellService", "RF", "SellEquipped"),
 	UpdateAutoSell = rem("SellService", "RE", "UpdateAutoSell"),
-	SetSetting     = rem("SettingsService", "RE", "SetSetting"),
 	CollectBalance = rem("PlotService", "RE", "CollectBalance"),
 	EquipBest      = rem("PlotService", "RE", "EquipBest"),
 	LevelUpSlot    = rem("PlotService", "RE", "LevelUpSlot"),
+	Rebirth        = rem("RebirthService", "RE", "Rebirth"),
+	BuyDice        = rem("DiceShopService", "RE", "BuyDice"),
+	EquipDice      = rem("DiceShopService", "RE", "EquipDice"),
 	QuestClaim     = rem("QuestService", "RE", "Claim"),
 	QuestBuy       = rem("QuestService", "RE", "Buy"),
 	DailyClaim     = rem("DailyRewardService", "RE", "Claim"),
 	GroupClaim     = rem("GroupRewardService", "RE", "Claim"),
 	OfflineClaim   = rem("OfflineEarningsService", "RE", "Claim"),
-	Rebirth        = rem("RebirthService", "RE", "Rebirth"),
-	BuyDice        = rem("DiceShopService", "RE", "BuyDice"),
-	EquipDice      = rem("DiceShopService", "RE", "EquipDice"),
 	GradeRoll      = rem("GradeService", "RE", "Roll"),
 	GradeProtect   = rem("GradeService", "RE", "SetGradeProtected"),
 	TraitRoll      = rem("TraitService", "RE", "Roll"),
 	TraitProtect   = rem("TraitService", "RE", "SetTraitProtected"),
-	Equip          = rem("UnitService", "RF", "Equip"),
-	Unequip        = rem("UnitService", "RF", "Unequip"),
-	SetLocked      = rem("UnitService", "RE", "SetLocked"),
+	QuirkRoll      = rem("QuirkService", "RE", "Roll"),
+	QuirkProtect   = rem("QuirkService", "RE", "SetQuirkProtected"),
+	UnitSetLocked  = rem("UnitService", "RE", "SetLocked"),
+	GearEquip      = rem("GearService", "RE", "Equip"),
+	RebirthAddStat = rem("RebirthService", "RE", "AddStat"),
 	BoostUse       = rem("BoostService", "RE", "Use"),
 	SpinUse        = rem("SpinService", "RE", "Use"),
 	Fuse           = rem("FusingService", "RE", "Fuse"),
+	Redeem         = rem("CodesService", "RE", "RedeemCode"),
 	TowerPlay      = rem("Towers", "RF", "PlayTower"),
 	TowerFloor     = rem("Towers", "RF", "CompleteTowerFloor"),
 	TowerCancel    = rem("Towers", "RF", "CancelTower"),
 	TowerEquipBest = rem("Towers", "RE", "EquipBestTowerTeam"),
-	FuseResult     = rem("FusingService", "RE", "Result"),
-	Redeem         = rem("MonetizationService", "RE", "RedeemCode"),
+	TowerSetAuto   = rem("Towers", "RE", "SetAutoTower"),
+	TowerUpdateTeam = rem("Towers", "RE", "UpdateTowerTeam"),
 }
-R.BuyUpgrade = waitFor(Net, "RE") and waitFor(Net.RE, "BuyUpgrade")
+local topRE = Net:FindFirstChild("RE")
+R.BuyUpgrade = topRE and topRE:FindFirstChild("BuyUpgrade")
 
--- game config tables (all replicated to the client) --------------------------
+-- game config + live state modules (all replicated to the client) ------------
 local function mod(path)
 	local node = RS
 	for seg in string.gmatch(path, "[^%.]+") do
 		node = node and node:FindFirstChild(seg)
 	end
 	if not node then
-		warn("[ADH] missing module " .. path)
+		warn("[ADF] missing module " .. path)
 		return nil
 	end
 	local ok, m = pcall(require, node)
 	if not ok then
-		warn("[ADH] require failed " .. path .. ": " .. tostring(m))
+		warn("[ADF] require failed " .. path .. ": " .. tostring(m))
 		return nil
 	end
 	return m
 end
 
-local ER        = mod("Framework.Features.Inventory.EntryRegistry")
-local Rar       = mod("Framework.Other.Rarities")
-local DiceCfg   = mod("Framework.Features.Rolling.Dice")
-local Grades    = mod("Framework.Features.Grades.Grades")
-local Traits    = mod("Framework.Features.Traits.Traits")
-local Rebirths  = mod("Framework.Features.Rebirth.Rebirths")
-local Upgrades  = mod("Framework.Features.Upgrades.Upgrades")
-local Tree      = mod("Framework.Features.Upgrades.TreeStructure")
-local QuestCfg  = mod("Framework.Features.Quests.QuestConfig")
-local PlotCfg   = mod("Framework.Features.Plot.PlotConfig")
-local MonetCfg  = mod("Framework.Features.Monetization.MonetizationConfig")
+local ER       = mod("Framework.Features.Inventory.EntryRegistry")
+local Rar      = mod("Framework.Other.Rarities")
+local DiceCfg  = mod("Framework.Features.Rolling.Dice")
+local Grades   = mod("Framework.Features.Grades.Grades")
+local Traits   = mod("Framework.Features.Traits.Traits")
+local Quirks   = mod("Framework.Features.Quirks.Quirks")
+local QuirkUtil = mod("Framework.Features.Quirks.QuirkUtil")
+local UnitUtil = mod("Framework.Features.Inventory.Kinds.Unit.UnitUtil")
+local RebirthStatsCfg = mod("Framework.Features.Rebirth.RebirthStatsConfig")
+local Rebirths = mod("Framework.Features.Rebirth.Rebirths")
+local Upgrades = mod("Framework.Features.Upgrades.Upgrades")
+local Tree     = mod("Framework.Features.Upgrades.TreeStructure")
+local QuestCfg = mod("Framework.Features.Quests.QuestConfig")
+local CodesCfg = mod("Framework.Features.Codes.CodesConfig")
+local D        = mod("Framework.Features.Data.DataController")
+local BuffC    = mod("Framework.Features.Buffs.BuffController")
 local TowersCfg = mod("Framework.Features.Towers.Towers")
-local FusingCfg = mod("Framework.Features.Fusing.FusingConfig")
-local UIRefs    = mod("Framework.Features.UI.UIReferences")
-local D         = mod("Framework.Features.Data.DataController")
-local BuffC     = mod("Framework.Features.Buffs.BuffController")
+local TowerRefs = mod("Framework.Features.Towers.TowerRefs")
 
 if not (ER and D) then
-	return warn("[ADH] core modules unavailable, aborting")
+	warn("[ADF] core modules unavailable, aborting")
+	return
 end
 
--- config ---------------------------------------------------------------------
-local Cfg = {
-	enabled = {
-		autoRoll       = true,
-		autoCollect    = true,
-		autoSell       = true,
-		autoEquipBest  = true,
-		autoUpgrades   = true,
-		autoQuests     = true,
-		autoQuestShop  = true,
-		autoClaims     = true,
-		autoGrade      = true,
-		autoTrait      = true,
-		autoDice       = true,
-		autoBoostSpins = true,
-		autoRedeem     = true,
-		autoRebirth    = true,
-		autoTower      = false,
-		autoFuse       = true,
-		killShowcase   = true,
-		killAutoRoll   = false,
-		serverAutoSell = false,
-	},
-	rollInterval    = 2.9,
-	collectInterval = 5,
-	sellInterval    = 8,
-	upgradeInterval = 3,
-	diceInterval    = 30,
-	claimInterval   = 45,
-	questInterval   = 15,
-	gradeInterval   = 0.45,
-	fuseInterval    = 5,
-	fuseMaxChance   = 50000,
-	fuseFloorUnits  = 25,
-	fuseMoneyMultiple = 5,
-	-- selling
-	sellChance      = 1000,
-	keepRarity      = 4,
-	keepTop         = 8,
-	keepMutated     = false,
-	maxUnits        = 70,
-	reserveUnits    = 20,
-	sellBatch       = 60,
-	-- targets
-	gradeTarget     = 3,
-	traitTarget     = 2,
-	moneyReserve    = 0,
-	diceSpendFrac   = 0.5,
-	questShopPriority = { "Roll Speed", "More Cash", "Luck", "Ultra Luck", "Trait Reroll", "Gems", "Lucky Spin" },
-	priorityUpgrades = { "Roll Speed", "Unit Storage" },
-	questShopPerTick = 2,
-	rareLogChance   = 1000,
-	fuseMinMoney    = 1e6,
-	towerName       = nil,
-	serverAutoSellValue = 0,
-	uiKey           = Enum.KeyCode.RightShift,
-}
-
--- runtime state --------------------------------------------------------------
+-- helpers --------------------------------------------------------------------
 local State = {
-	connections = {},
-	tasks = {},
-	running = true,
-	fuseActive = false,
-	towerActive = false,
-	towerStalls = 0,
+	running = true, nextRollAt = 0,
+	towerActive = false, towerStalls = 0, towerCooldown = 0,
+	redeemDone = false, towerAutoSet = nil,
 }
-
 local Stats = {
-	rolls = 0, soldUnits = 0, soldMoney = 0,
+	rolls = 0, soldUnits = 0, soldMoney = 0, earned = 0,
 	money = 0, moneyPerMin = 0, rollsPerMin = 0,
-	startClock = os.clock(), lastRollClock = os.clock(),
-	rares = {}, log = {}, earned = 0,
+	rares = {}, log = {},
 }
 
-local function log(msg, colour)
-	table.insert(Stats.log, 1, {
-		text = os.date("[%H:%M:%S] ") .. msg,
-		colour = colour or Color3.fromRGB(220, 220, 220),
-	})
-	while #Stats.log > 40 do
-		table.remove(Stats.log)
-	end
-end
--- data helpers ---------------------------------------------------------------
 local function pv(fn, ...)
 	local ok, v = pcall(fn, ...)
 	if ok then return v end
 	return nil
+end
+
+local function log(msg)
+	table.insert(Stats.log, 1, os.date("[%H:%M:%S] ") .. msg)
+	while #Stats.log > 14 do
+		table.remove(Stats.log)
+	end
 end
 
 local function money()
@@ -243,37 +188,11 @@ end
 
 local function buff(name)
 	if not BuffC then return nil end
-	local v = pv(BuffC.GetBuff, name)
-	return tonumber(v)
+	return tonumber(pv(BuffC.GetBuff, name))
 end
 
 local function inventoryCap()
 	return buff("Unit Storage") or 100
-end
-
-local function unitEntries()
-	local out = {}
-	for key, e in pairs(inventory()) do
-		local cfg = ER.getEntryConfig(e.name)
-		if cfg and cfg.kind == "Unit" then
-			local attrs = e.attributes or {}
-			local inc = tonumber(pv(cfg.income, attrs)) or 0
-			local ch = tonumber(pv(cfg.chance, attrs)) or 0
-			table.insert(out, {
-				key = key, name = e.name, attrs = attrs, cfg = cfg,
-				income = inc, chance = ch, amount = tonumber(e.amount) or 1,
-			})
-		end
-	end
-	return out
-end
-
-local function rarityOrder(name)
-	if Rar and Rar.Get and name then
-		local r = pv(Rar.Get, name)
-		if typeof(r) == "table" and tonumber(r.sortOrder) then return tonumber(r.sortOrder) end
-	end
-	return 1
 end
 
 local function fmt(n)
@@ -283,11 +202,24 @@ local function fmt(n)
 	if n >= 1e9 then return string.format("%.2fB", n / 1e9) end
 	if n >= 1e6 then return string.format("%.2fM", n / 1e6) end
 	if n >= 1e3 then return string.format("%.1fK", n / 1e3) end
-	return string.format("%d", n)
+	return string.format("%d", math.floor(n))
 end
 
-local function chanceOf(cfg, attrs)
-	return tonumber(pv(cfg.chance, attrs)) or 0
+local function unitEntries()
+	local out = {}
+	for key, e in pairs(inventory()) do
+		local cfg = ER.getEntryConfig(e.name)
+		if cfg and cfg.kind == "Unit" then
+			local attrs = e.attributes or {}
+			table.insert(out, {
+				key = key, name = e.name, attrs = attrs, cfg = cfg,
+				income = tonumber(pv(cfg.income, attrs)) or 0,
+				chance = tonumber(pv(cfg.chance, attrs)) or 0,
+				amount = tonumber(e.amount) or 1,
+			})
+		end
+	end
+	return out
 end
 
 local function plottedKeys()
@@ -297,48 +229,352 @@ local function plottedKeys()
 	end
 	return set
 end
--- actions --------------------------------------------------------------------
-local A = {}
 
-function A.roll()
+local A = {} -- action implementations (defined below; referenced by UI callbacks)
+
+-- UI -------------------------------------------------------------------------
+local C = {}          -- live control handles
+local allToggles = {} -- for STOP ALL
+
+local function toggle_(section, spec)
+	local c = section:Toggle(spec)
+	C[spec.Id] = c
+	table.insert(allToggles, c)
+	return c
+end
+
+local function ctl(section, kind, spec)
+	local c = section[kind](section, spec)
+	C[spec.Id] = c
+	return c
+end
+
+local stopAll = function()
+	for _, t in ipairs(allToggles) do
+		if t:Get() then t:Set(false) end
+	end
+	for _, id in ipairs({ "mirrorAutoSell", "mirrorAutoRoll", "towerGameAuto" }) do
+		local c = C[id]
+		if c and c:Get() then c:Set(false) end
+	end
+	if R.SetAutoRoll then pcall(R.SetAutoRoll.FireServer, R.SetAutoRoll, false) end
+	if R.UpdateAutoSell then pcall(R.UpdateAutoSell.FireServer, R.UpdateAutoSell, 0) end
+	if R.TowerSetAuto and State.towerAutoSet then
+		pcall(R.TowerSetAuto.FireServer, R.TowerSetAuto, false)
+		State.towerAutoSet = nil
+	end
+	log("STOP ALL - every module disabled")
+end
+
+-- Farm -----------------------------------------------------------------------
+local farmTab = window:Tab({ Title = "Farm" })
+
+local profileSec = farmTab:Section({ Title = "Profile" })
+profileSec:Button({
+	Id = "saveCfg", Text = "Save current settings", ActionText = "Save",
+	Callback = function()
+		local ok, detail = window:SaveConfig("anime-dice-autofarm")
+		window:Notify({
+			Title = ok and "Settings saved" or "Save failed",
+			Content = tostring(detail),
+			Kind = ok and "Success" or "Warning",
+		})
+	end,
+})
+profileSec:Button({
+	Id = "loadCfg", Text = "Load saved settings", ActionText = "Load",
+	Callback = function()
+		local ok, detail = window:LoadConfig("anime-dice-autofarm", { Silent = false })
+		window:Notify({
+			Title = ok and "Settings loaded" or "Load failed",
+			Content = ok and (tostring(detail) .. " value(s) applied") or tostring(detail),
+			Kind = ok and "Success" or "Warning",
+		})
+	end,
+})
+
+local danger = farmTab:Section({ Title = "Emergency" })
+danger:Button({
+	Id = "stopAll", Text = "Stop everything", ActionText = "STOP ALL",
+	Style = "Danger",
+	Callback = function()
+		stopAll()
+		window:Notify({ Title = "Stopped", Content = "All autofarm modules disabled.", Kind = "Warning" })
+	end,
+})
+
+local rollSec = farmTab:Section({ Title = "Rolling" })
+toggle_(rollSec, { Id = "autoRoll", Text = "Auto roll", Default = true })
+ctl(rollSec, "Slider", {
+	Id = "rollInterval", Text = "Roll interval", Min = 2.2, Max = 10, Step = 0.1,
+	Default = 2.9, Suffix = "s",
+})
+rollSec:Button({
+	Id = "rollOnce", Text = "Roll now", ActionText = "Roll",
+	Callback = function()
+		local ok = A.roll(true)
+		window:Notify({
+			Title = ok and "Rolled" or "Roll skipped",
+			Content = ok and "Result added to inventory." or "On cooldown or inventory full.",
+			Kind = ok and "Success" or "Warning",
+		})
+	end,
+})
+
+local sellSec = farmTab:Section({ Title = "Selling" })
+toggle_(sellSec, { Id = "autoSell", Text = "Auto sell junk", Default = true })
+ctl(sellSec, "Slider", {
+	Id = "sellInterval", Text = "Sell loop interval", Min = 3, Max = 60, Step = 1,
+	Default = 8, Suffix = "s",
+})
+ctl(sellSec, "Dropdown", {
+	Id = "sellChance", Text = "Sell units commoner than", Default = 1000,
+	Options = {
+		{ Label = "1 in 100", Value = 100 },
+		{ Label = "1 in 500", Value = 500 },
+		{ Label = "1 in 1,000", Value = 1000 },
+		{ Label = "1 in 5,000", Value = 5000 },
+		{ Label = "1 in 10,000", Value = 10000 },
+		{ Label = "1 in 100,000", Value = 100000 },
+		{ Label = "1 in 1,000,000", Value = 1000000 },
+	},
+})
+ctl(sellSec, "Slider", { Id = "keepTop", Text = "Always keep top", Min = 0, Max = 40, Step = 1, Default = 8 })
+ctl(sellSec, "Slider", {
+	Id = "keepRarity", Text = "Free-space protection up to rarity", Min = 0, Max = 12, Step = 1,
+	Default = 4,
+})
+ctl(sellSec, "Toggle", { Id = "keepMutated", Text = "Never sell mutated units", Default = false })
+ctl(sellSec, "Slider", {
+	Id = "maxUnits", Text = "Inventory target (0 = off)", Min = 0, Max = 150, Step = 5, Default = 70,
+})
+ctl(sellSec, "Slider", { Id = "reserveUnits", Text = "Keep free slots", Min = 5, Max = 100, Step = 5, Default = 20 })
+ctl(sellSec, "Slider", { Id = "sellBatch", Text = "Sell batch size", Min = 10, Max = 100, Step = 10, Default = 60 })
+sellSec:Button({
+	Id = "sellNow", Text = "Sell the junk now", ActionText = "Sell",
+	Callback = function()
+		local sold = A.sell()
+		window:Notify({
+			Title = sold > 0 and ("Sold " .. sold .. " units") or "Nothing to sell",
+			Content = sold > 0 and "Money incoming." or "Inventory is already clean.",
+			Kind = sold > 0 and "Success" or "Info",
+		})
+	end,
+})
+
+local plotSec = farmTab:Section({ Title = "Plot income" })
+toggle_(plotSec, { Id = "autoCollect", Text = "Auto collect balance", Default = true })
+ctl(plotSec, "Slider", { Id = "collectInterval", Text = "Collect interval", Min = 2, Max = 30, Step = 1, Default = 5, Suffix = "s" })
+toggle_(plotSec, { Id = "autoEquipBest", Text = "Auto equip best", Default = true })
+ctl(plotSec, "Slider", { Id = "equipInterval", Text = "Equip interval", Min = 5, Max = 120, Step = 5, Default = 20, Suffix = "s" })
+toggle_(plotSec, { Id = "autoLevelSlots", Text = "Auto level up plot slots", Default = true })
+ctl(plotSec, "Slider", { Id = "levelSlotInterval", Text = "Slot level interval", Min = 5, Max = 120, Step = 5, Default = 15, Suffix = "s" })
+plotSec:Button({
+	Id = "collectNow", Text = "Collect + equip now", ActionText = "Run",
+	Callback = function()
+		local n = A.collect()
+		A.equipBest()
+		window:Notify({ Title = "Plot updated", Content = "Collected " .. n .. " slot(s) and equipped the best team.", Kind = "Success" })
+	end,
+})
+
+-- Economy --------------------------------------------------------------------
+local ecoTab = window:Tab({ Title = "Economy" })
+
+local upSec = ecoTab:Section({ Title = "Upgrades" })
+toggle_(upSec, { Id = "autoUpgrades", Text = "Auto buy upgrades", Default = true })
+ctl(upSec, "Slider", { Id = "upgradeInterval", Text = "Upgrade interval", Min = 2, Max = 30, Step = 1, Default = 3, Suffix = "s" })
+ctl(upSec, "Input", {
+	Id = "moneyReserve", Text = "Money reserve", Numeric = true, Min = 0,
+	Default = 0, Placeholder = "0",
+})
+
+local rebSec = ecoTab:Section({ Title = "Rebirth" })
+toggle_(rebSec, { Id = "autoRebirth", Text = "Auto rebirth", Default = true })
+ctl(rebSec, "Slider", { Id = "rebirthInterval", Text = "Rebirth check interval", Min = 5, Max = 120, Step = 5, Default = 10, Suffix = "s" })
+toggle_(rebSec, { Id = "autoRebirthStats", Text = "Auto spend rebirth points", Default = true })
+ctl(rebSec, "Dropdown", {
+	Id = "rebirthStat", Text = "Rebirth stat priority", Default = "Money",
+	Options = { "Money", "Luck", "Damage" },
+})
+
+local diceSec = ecoTab:Section({ Title = "Dice" })
+toggle_(diceSec, { Id = "autoDice", Text = "Auto dice shop", Default = true })
+ctl(diceSec, "Slider", { Id = "diceInterval", Text = "Dice shop interval", Min = 10, Max = 300, Step = 10, Default = 30, Suffix = "s" })
+ctl(diceSec, "Slider", { Id = "diceSpendFrac", Text = "Max spend per buy", Min = 0.05, Max = 1, Step = 0.05, Default = 0.5 })
+
+local shopSec = ecoTab:Section({ Title = "Quest shop" })
+toggle_(shopSec, { Id = "autoQuestShop", Text = "Auto spend tickets", Default = true })
+ctl(shopSec, "Slider", { Id = "questShopPerTick", Text = "Buys per pass", Min = 1, Max = 5, Step = 1, Default = 2 })
+
+-- Extras ---------------------------------------------------------------------
+local extrasTab = window:Tab({ Title = "Extras" })
+
+local qSec = extrasTab:Section({ Title = "Quests and claims" })
+toggle_(qSec, { Id = "autoQuests", Text = "Auto claim quests", Default = true })
+ctl(qSec, "Slider", { Id = "questInterval", Text = "Quest interval", Min = 5, Max = 120, Step = 5, Default = 15, Suffix = "s" })
+toggle_(qSec, { Id = "autoClaims", Text = "Auto daily / group / offline", Default = true })
+ctl(qSec, "Slider", { Id = "claimInterval", Text = "Claim interval", Min = 10, Max = 300, Step = 10, Default = 45, Suffix = "s" })
+
+local gtSec = extrasTab:Section({ Title = "Grade, trait and quirk" })
+toggle_(gtSec, { Id = "autoGrade", Text = "Auto grade (spends gems)", Default = true })
+ctl(gtSec, "Slider", { Id = "gradeTarget", Text = "Grade income target", Min = 0, Max = 20, Step = 0.5, Default = 3 })
+toggle_(gtSec, { Id = "autoTrait", Text = "Auto trait (spends rerolls)", Default = true })
+ctl(gtSec, "Slider", { Id = "traitTarget", Text = "Trait income target", Min = 0, Max = 10, Step = 0.5, Default = 2 })
+ctl(gtSec, "Slider", { Id = "gradeInterval", Text = "Reroll interval", Min = 0.2, Max = 3, Step = 0.05, Default = 0.45, Suffix = "s" })
+toggle_(gtSec, { Id = "autoQuirk", Text = "Auto quirk top plotted units (spends money)", Default = true })
+ctl(gtSec, "Slider", { Id = "quirkUnits", Text = "Top plotted units to quirk", Min = 1, Max = 8, Step = 1, Default = 3 })
+ctl(gtSec, "Slider", { Id = "quirkOrder", Text = "Stop when quirk order reaches", Min = 1, Max = 19, Step = 1, Default = 11 })
+toggle_(gtSec, { Id = "autoProtectDrops", Text = "Auto protect good grade/trait/quirk drops", Default = true })
+
+local towerSec = extrasTab:Section({ Title = "Towers" })
+toggle_(towerSec, { Id = "autoTower", Text = "Auto tower", Default = true })
+ctl(towerSec, "Toggle", { Id = "towerGameAuto", Text = "Use game-side auto-tower (SetAutoTower)", Default = true })
+ctl(towerSec, "Slider", { Id = "towerInterval", Text = "Restart interval", Min = 5, Max = 120, Step = 5, Default = 10, Suffix = "s" })
+ctl(towerSec, "Slider", { Id = "towerFloorInterval", Text = "Floor interval", Min = 0.5, Max = 5, Step = 0.5, Default = 1.5, Suffix = "s" })
+local towerOptions, bestTower = {}, nil
+if TowersCfg and TowersCfg.GetAll then
+	local ok, all = pcall(TowersCfg.GetAll)
+	if ok and typeof(all) == "table" then
+		local list, bestOrder = {}, -1
+		for name, cfg in pairs(all) do
+			table.insert(list, { name = name, order = tonumber(cfg.order) or 0 })
+		end
+		table.sort(list, function(a, b) return a.order > b.order end)
+		for _, t in ipairs(list) do
+			table.insert(towerOptions, t.name)
+			if t.order > bestOrder then
+				bestOrder, bestTower = t.order, t.name
+			end
+		end
+	end
+end
+ctl(towerSec, "Dropdown", {
+	Id = "towerName", Text = "Tower (falls back down the list if it keeps failing)",
+	Options = towerOptions, Default = bestTower, Placeholder = "No towers found",
+})
+towerSec:Button({
+	Id = "equipTowerTeam", Text = "Equip best tower team", ActionText = "Equip",
+	Callback = function()
+		if R.TowerEquipBest then
+			R.TowerEquipBest:FireServer()
+			window:Notify({ Title = "Tower team", Content = "Equip best tower team requested.", Kind = "Success" })
+		end
+	end,
+})
+
+local conSec = extrasTab:Section({ Title = "Consumables" })
+toggle_(conSec, { Id = "autoBoostSpins", Text = "Auto use boosts and spins", Default = true })
+ctl(conSec, "Slider", { Id = "boostInterval", Text = "Boost interval", Min = 10, Max = 120, Step = 10, Default = 30, Suffix = "s" })
+toggle_(conSec, { Id = "autoFuse", Text = "Auto fuse (burns 3 commons)", Default = false })
+ctl(conSec, "Slider", { Id = "fuseInterval", Text = "Fuse interval", Min = 10, Max = 120, Step = 10, Default = 20, Suffix = "s" })
+ctl(conSec, "Input", { Id = "fuseMinMoney", Text = "Min money to fuse", Numeric = true, Min = 0, Default = 1000000, Placeholder = "1000000" })
+toggle_(conSec, { Id = "autoRedeem", Text = "Auto redeem codes (once per session)", Default = true })
+
+local secSec = extrasTab:Section({ Title = "Protection" })
+toggle_(secSec, { Id = "autoLock", Text = "Auto lock rares (uses UnitService.SetLocked)", Default = true })
+ctl(secSec, "Toggle", {
+	Id = "mirrorAutoRoll", Text = "Mirror auto-roll to game AutoRoll", Default = false,
+	Callback = function(on)
+		if R.SetAutoRoll then R.SetAutoRoll:FireServer(on == true) end
+	end,
+})
+
+local gameSec = extrasTab:Section({ Title = "Game-side auto sell" })
+ctl(gameSec, "Toggle", {
+	Id = "mirrorAutoSell", Text = "Mirror sell threshold to game AutoSell", Default = false,
+	Callback = function(on)
+		if R.UpdateAutoSell then
+			R.UpdateAutoSell:FireServer(on and (C.sellChance:Get() or 0) or 0)
+		end
+	end,
+})
+
+-- Log ------------------------------------------------------------------------
+local logTab = window:Tab({ Title = "Log" })
+local liveSec = logTab:Section({ Title = "Live" })
+C.badgeMoney  = liveSec:Badge({ Id = "badgeMoney", Text = "Money", Default = "$0", Kind = "Success" })
+C.badgeRolls  = liveSec:Badge({ Id = "badgeRolls", Text = "Rolls / min", Default = "0", Kind = "Secondary" })
+C.badgeEarn   = liveSec:Badge({ Id = "badgeEarn", Text = "Earned / min", Default = "$0", Kind = "Secondary" })
+C.badgeUnits  = liveSec:Badge({ Id = "badgeUnits", Text = "Units", Default = "0", Kind = "Secondary" })
+
+local feedSec = logTab:Section({ Title = "Feed" })
+local logLabel = feedSec:Label({ Id = "logFeed", Text = "Waiting for the first action...", Description = "" })
+feedSec:Button({
+	Id = "clearLog", Text = "Clear feed", ActionText = "Clear",
+	Callback = function()
+		table.clear(Stats.log)
+		logLabel:SetText("Feed cleared.")
+	end,
+})
+
+local function refreshLog()
+	local lines = {}
+	for _, entry in ipairs(Stats.log) do
+		table.insert(lines, entry)
+	end
+	if #lines == 0 then lines = { "No activity yet." } end
+	logLabel:SetText(table.concat(lines, "\n"))
+end
+
+-- extra Rolling control, kept with the roll settings in the Farm tab ----------
+ctl(rollSec, "Dropdown", {
+	Id = "rareLogChance", Text = "Log rolls rarer than", Default = 1000,
+	Options = {
+		{ Label = "1 in 100", Value = 100 },
+		{ Label = "1 in 500", Value = 500 },
+		{ Label = "1 in 1,000", Value = 1000 },
+		{ Label = "1 in 5,000", Value = 5000 },
+		{ Label = "1 in 50,000", Value = 50000 },
+		{ Label = "1 in 1,000,000", Value = 1000000 },
+	},
+})
+
+-- actions --------------------------------------------------------------------
+local function rarityOrder(name)
+	if Rar and Rar.Get and name then
+		local r = pv(Rar.Get, name)
+		if typeof(r) == "table" and tonumber(r.sortOrder) then return tonumber(r.sortOrder) end
+	end
+	return 1
+end
+
+function A.roll(force)
 	if not R.Roll then return false end
-	if os.clock() < (State.nextRollAt or 0) then return false end
-	local res = R.Roll:InvokeServer()
-	if typeof(res) ~= "table" then
+	if not force and os.clock() < State.nextRollAt then return false end
+	local ok, res = pcall(R.Roll.InvokeServer, R.Roll)
+	if not ok or typeof(res) ~= "table" then
+		-- throttled by the server, or the inventory is too full to accept a unit
 		State.nextRollAt = os.clock() + 0.4
 		local cap = inventoryCap()
 		local n = #unitEntries()
-		if n >= cap and os.clock() - (Stats.lastFullWarn or 0) > 15 then
-			Stats.lastFullWarn = os.clock()
-			log("roll blocked: " .. n .. "/" .. cap .. " units - freeing space", Color3.fromRGB(255, 200, 120))
-		end
 		if n >= cap - 5 and os.clock() - (State.lastEmergencySell or 0) > 4 then
 			State.lastEmergencySell = os.clock()
+			log("inventory near cap (" .. n .. "/" .. cap .. ") - emergency sell")
 			task.spawn(A.sell)
 		end
 		return false
 	end
-	State.nextRollAt = os.clock() + Cfg.rollInterval
+	State.nextRollAt = os.clock() + (C.rollInterval:Get() or 2.9)
 	Stats.rolls = Stats.rolls + 1
-	Stats.rolls = Stats.rolls + 1
-	Stats.lastRollClock = os.clock()
+	local threshold = C.rareLogChance:Get() or 1000
 	for _, r in ipairs(res) do
 		if typeof(r) == "table" and r.result then
 			local cfg = ER.getEntryConfig(r.result)
-			local ch = cfg and chanceOf(cfg, { mutation = r.mutation }) or 0
-			if ch >= Cfg.rareLogChance then
+			local ch = cfg and (tonumber(pv(cfg.chance, { mutation = r.mutation })) or 0) or 0
+			if ch >= threshold then
 				local label = tostring(r.result)
 				if r.mutation then label = tostring(r.mutation) .. " " .. label end
 				table.insert(Stats.rares, 1, label .. " (1/" .. fmt(ch) .. ")")
 				while #Stats.rares > 8 do table.remove(Stats.rares) end
-				log("ROLLED " .. label .. "  1 in " .. fmt(ch), Color3.fromRGB(255, 105, 220))
+				log("ROLLED " .. label .. " 1 in " .. fmt(ch))
 			end
 		end
 	end
 	return true
 end
 
-function A.sellList()
+local function sellList()
 	local plotted = plottedKeys()
 	local units = unitEntries()
 	table.sort(units, function(a, b) return a.income > b.income end)
@@ -350,37 +586,44 @@ function A.sellList()
 		end
 	end
 
-	-- tier 1: junk pass - anything commoner than the sell threshold
+	local sellChance = C.sellChance:Get() or 1000
+	local keepTop = C.keepTop:Get() or 0
+	local keepMutated = C.keepMutated:Get()
+
+	-- tier 1: the routine junk pass
 	for i, u in ipairs(units) do
-		if i > Cfg.keepTop and u.chance < Cfg.sellChance
-			and not u.attrs.locked and not plotted[u.key]
-			and not (Cfg.keepMutated and u.attrs.mutation) then
+		if i > keepTop and u.chance < sellChance and not u.attrs.locked
+			and not plotted[u.key] and not (keepMutated and u.attrs.mutation) then
 			add(u)
 		end
 	end
 
 	local cap = inventoryCap()
 	local remaining = #units - #list
+	local maxUnits = C.maxUnits:Get() or 0
 
-	-- tier 2: compaction - hold the inventory down to the unit target
-	if Cfg.maxUnits > 0 and remaining > Cfg.maxUnits then
+	-- tier 2: compaction down to the inventory target
+	if maxUnits > 0 and remaining > maxUnits then
 		for i = #units, 1, -1 do
-			if remaining <= Cfg.maxUnits then break end
+			if remaining <= maxUnits then break end
 			local u = units[i]
-			if i > Cfg.keepTop and not u.attrs.locked and not plotted[u.key] and not seen[u.key] then
+			if i > keepTop and not u.attrs.locked and not plotted[u.key] and not seen[u.key] then
 				add(u)
 				remaining = remaining - 1
 			end
 		end
 	end
 
-	-- tier 3: keep free space (hard protection: locked, plotted, top-keep)
-	if remaining > cap - Cfg.reserveUnits then
+	local reserve = C.reserveUnits:Get() or 20
+	local keepRarity = C.keepRarity:Get() or 4
+
+	-- tier 3: free-space protection (still keeps locked, plotted and top units)
+	if remaining > cap - reserve then
 		for i = #units, 1, -1 do
-			if remaining <= cap - Cfg.reserveUnits then break end
+			if remaining <= cap - reserve then break end
 			local u = units[i]
-			if i > Cfg.keepTop and not u.attrs.locked and not plotted[u.key]
-				and rarityOrder(u.cfg.rarity) < Cfg.keepRarity and not seen[u.key] then
+			if i > keepTop and not u.attrs.locked and not plotted[u.key]
+				and rarityOrder(u.cfg.rarity) < keepRarity and not seen[u.key] then
 				add(u)
 				remaining = remaining - 1
 			end
@@ -404,29 +647,27 @@ end
 
 function A.sell()
 	if not R.SellInventory then return 0 end
-	local list, unitCount, cap = A.sellList()
-	if #list == 0 then
-		if unitCount >= cap - 5 then
-			log("nothing sellable but " .. unitCount .. "/" .. cap .. " units", Color3.fromRGB(255, 160, 120))
-		end
-		return 0
-	end
+	local list, unitCount, cap = sellList()
+	if #list == 0 then return 0 end
+	local batchSize = math.max(1, math.floor(C.sellBatch:Get() or 60))
 	local sold, gained, i = 0, 0, 1
 	while i <= #list do
 		local batch = {}
-		for j = i, math.min(i + Cfg.sellBatch - 1, #list) do
+		for j = i, math.min(i + batchSize - 1, #list) do
 			table.insert(batch, list[j])
 		end
-		local moneyGained, unitsSold = R.SellInventory:InvokeServer(batch)
-		if typeof(unitsSold) == "number" then sold = sold + unitsSold end
-		if typeof(moneyGained) == "number" then gained = gained + moneyGained end
-		i = i + Cfg.sellBatch
+		local ok, moneyGained, unitsSold = pcall(R.SellInventory.InvokeServer, R.SellInventory, batch)
+		if ok then
+			if typeof(unitsSold) == "number" then sold = sold + unitsSold end
+			if typeof(moneyGained) == "number" then gained = gained + moneyGained end
+		end
+		i = i + batchSize
 		if i <= #list then task.wait(0.15) end
 	end
-	if sold > 0 and (sold >= 3 or unitCount - sold > Cfg.maxUnits + 10) then
+	if sold > 0 then
 		Stats.soldUnits = Stats.soldUnits + sold
 		Stats.soldMoney = Stats.soldMoney + gained
-		log(string.format("sold %d units for %s  (%d/%d left)", sold, fmt(gained), unitCount - sold, cap), Color3.fromRGB(130, 255, 160))
+		log(string.format("sold %d units for %s (%d/%d left)", sold, fmt(gained), unitCount - sold, cap))
 	end
 	return sold
 end
@@ -444,22 +685,57 @@ function A.collect()
 	return n
 end
 
-function A.equipBest()
-	if R.EquipBest then R.EquipBest:FireServer() end
-	if R.TowerEquipBest then R.TowerEquipBest:FireServer() end
+function A.levelSlots()
+	if not R.LevelUpSlot then return 0 end
+	local reserve = tonumber(C.moneyReserve:Get()) or 0
+	local cash = money()
+	local n = 0
+	for i, s in pairs(slots()) do
+		local idx = tonumber(i)
+		if idx and typeof(s) == "table" and s.unitId then
+			local e = inventory()[s.unitId]
+			local price = (UnitUtil and e) and tonumber(pv(UnitUtil.GetLevelPrice, e.name, e.attributes or {}))
+			if price and cash - price >= reserve then
+				R.LevelUpSlot:FireServer(idx)
+				cash = cash - price
+				n = n + 1
+				if n >= 3 then break end
+				task.wait(0.1)
+			elseif not price then
+				R.LevelUpSlot:FireServer(idx)
+				n = n + 1
+				if n >= 2 then break end
+				task.wait(0.1)
+			end
+		end
+	end
+	if n > 0 then log("leveled " .. n .. " plot slot(s)") end
+	return n
 end
 
-local function isPriorityUpgrade(name)
-	for _, pat in ipairs(Cfg.priorityUpgrades) do
-		if string.find(name, pat, 1, true) then return true end
-	end
-	return false
+function A.equipBest()
+	if R.EquipBest then R.EquipBest:FireServer() end
+end
+
+function A.rebirthStats()
+	if not (RebirthStatsCfg and R.RebirthAddStat) then return false end
+	local rb = tonumber(pv(function() return D.Rebirth() end)) or 0
+	if rb < 1 then return false end
+	local spent = pv(function() return D.RebirthStats() end) or {}
+	local remaining = RebirthStatsCfg.GetRemaining
+		and tonumber(pv(RebirthStatsCfg.GetRemaining, rb, spent)) or 0
+	if (remaining or 0) < 1 then return false end
+	local want = (C.rebirthStat and C.rebirthStat:Get()) or "Money"
+	R.RebirthAddStat:FireServer(want)
+	log("rebirth point -> " .. want .. " (" .. tostring(remaining - 1) .. " left)")
+	return true
 end
 
 function A.upgrades()
 	if not (Upgrades and R.BuyUpgrade) then return 0 end
 	local owned = pv(function() return D.Upgrades() end) or {}
 	local cash = money()
+	local reserve = tonumber(C.moneyReserve:Get()) or 0
 	local cands = {}
 	for name, u in pairs(Upgrades) do
 		local price = tonumber(u.price)
@@ -470,14 +746,10 @@ function A.upgrades()
 			end
 		end
 	end
-	table.sort(cands, function(a, b)
-		local pa, pb = isPriorityUpgrade(a.name), isPriorityUpgrade(b.name)
-		if pa ~= pb then return pa end
-		return a.price < b.price
-	end)
+	table.sort(cands, function(a, b) return a.price < b.price end)
 	local bought = 0
 	for _, c in ipairs(cands) do
-		if cash - c.price >= Cfg.moneyReserve then
+		if cash - c.price >= reserve then
 			R.BuyUpgrade:FireServer(c.name)
 			cash = cash - c.price
 			bought = bought + 1
@@ -490,50 +762,59 @@ function A.upgrades()
 	if bought > 0 then log("bought " .. bought .. " upgrade(s)") end
 	return bought
 end
+
 function A.quests()
 	if not (QuestCfg and R.QuestClaim) then return 0 end
-	local claimed = 0
-	local state = pv(function() return D.Quests end)
+	local snapAll = pv(function() return D.Quests() end)
+	if typeof(snapAll) ~= "table" then return 0 end
+	local claimedN = 0
 	for pname, pcfg in pairs(QuestCfg.Periods or {}) do
-		local snap
-		if state and state[pname] then snap = pv(state[pname]) end
+		local snap = snapAll[pname]
 		if typeof(snap) == "table" then
+			local progress = snap.progress or {}
+			local claimed = snap.claimed or {}
 			for _, quest in ipairs(pcfg.quests or {}) do
-				local prog = (snap.progress or {})[quest.id] or 0
-				if prog >= quest.target and not (snap.claimed or {})[quest.id] then
-					R.QuestClaim:FireServer(pname, quest.id, snap.expiresAt)
-					claimed = claimed + 1
-					log("quest claimed: " .. pname .. " / " .. quest.id .. " (+" .. tostring(quest.tickets) .. " tickets)",
-						Color3.fromRGB(150, 220, 255))
+				local id = quest.id
+				if id and (tonumber(progress[id]) or 0) >= (tonumber(quest.target) or math.huge)
+					and not claimed[id] then
+					R.QuestClaim:FireServer(pname, id, snap.expiresAt)
+					claimedN = claimedN + 1
+					log("quest claimed: " .. pname .. "/" .. tostring(id)
+						.. " (+" .. tostring(quest.tickets) .. " tickets)")
 					task.wait(0.3)
 				end
 			end
 		end
 	end
-	return claimed
+	return claimedN
 end
 
 function A.questShop()
-	if not (QuestCfg and R.QuestBuy) then return 0 end
-	local priority = {}
-	for i, n in ipairs(Cfg.questShopPriority) do priority[n] = i end
+	if not (QuestCfg and R.QuestBuy and QuestCfg.Shop) then return 0 end
+	local priority = { "Trait Reroll", "Gems", "Lucky Spin" }
+	local rank = {}
+	for i, n in ipairs(priority) do rank[n] = i end
 	local items = {}
-	for _, item in ipairs(QuestCfg.Shop or {}) do
-		if not item.gamepass and priority[item.name] then
+	for _, item in ipairs(QuestCfg.Shop) do
+		if not item.gamepass and typeof(item.name) == "string" then
 			table.insert(items, item)
 		end
 	end
-	table.sort(items, function(a, b) return priority[a.name] < priority[b.name] end)
+	table.sort(items, function(a, b)
+		local ra, rb = rank[a.name] or 99, rank[b.name] or 99
+		if ra ~= rb then return ra < rb end
+		return (tonumber(a.tickets) or 0) < (tonumber(b.tickets) or 0)
+	end)
 	local tickets = amountOf("Tickets")
-	local bought, names = 0, {}
-	for i = 1, Cfg.questShopPerTick do
+	local bought = 0
+	for _ = 1, (C.questShopPerTick:Get() or 2) do
 		local did = false
 		for _, item in ipairs(items) do
-			if tickets >= item.tickets then
+			local cost = tonumber(item.tickets) or math.huge
+			if tickets >= cost then
 				R.QuestBuy:FireServer(item.name)
-				tickets = tickets - item.tickets
+				tickets = tickets - cost
 				bought = bought + 1
-				table.insert(names, item.name)
 				did = true
 				task.wait(0.3)
 				break
@@ -541,49 +822,89 @@ function A.questShop()
 		end
 		if not did then break end
 	end
-	if bought > 0 then log("quest shop: " .. table.concat(names, ", "), Color3.fromRGB(255, 220, 140)) end
+	if bought > 0 then log("quest shop: bought " .. bought .. " item(s)") end
 	return bought
 end
 
 function A.claims()
+	local did = 0
 	if R.DailyClaim then
 		local last = tonumber(pv(function() return D.LastDailyRewardClaim() end)) or 0
 		if os.time() - last >= 82800 then
 			R.DailyClaim:FireServer()
+			did = did + 1
 			log("daily reward claimed")
 		end
 	end
 	if R.GroupClaim and not pv(function() return D.ClaimedGroupReward() end) then
 		R.GroupClaim:FireServer()
+		did = did + 1
+		log("group reward claimed")
 	end
 	if R.OfflineClaim and (tonumber(pv(function() return D.PendingOfflineEarnings() end)) or 0) > 0 then
 		R.OfflineClaim:FireServer()
+		did = did + 1
 		log("offline earnings claimed")
 	end
+	return did
+end
+
+local function gradeMultOf(u)
+	local g = Grades and u.attrs.grade and Grades[u.attrs.grade]
+	return (g and tonumber(g.incomeMultiplier)) or 1
+end
+
+local function traitMultOf(u)
+	local t = Traits and u.attrs.trait and Traits[u.attrs.trait]
+	return (t and tonumber(t.incomeMultiplier)) or 0
+end
+
+local function quirkOrderOf(u)
+	if not (Quirks and u.attrs.quirk) then return 0 end
+	local q = Quirks[u.attrs.quirk]
+	return (q and tonumber(q.order)) or 0
+end
+
+local function protectedSet(name)
+	-- DataController exposes ProtectedGrades/Traits/Quirks as state tables of getters.
+	local t = D[name]
+	if typeof(t) ~= "table" then return {} end
+	return t
 end
 
 function A.gradeTrait()
 	local gems = amountOf("Gems")
 	local rerolls = amountOf("Trait Reroll")
-	if (not Cfg.enabled.autoGrade or gems < 1) and (not Cfg.enabled.autoTrait or rerolls < 1) then return false end
+	local wantGrade = C.autoGrade:Get() and gems >= 2
+	local wantTrait = C.autoTrait:Get() and rerolls >= 2
+	if not (wantGrade or wantTrait) then return false end
+	-- Only touch units that matter: plotted first, then top earners. Never burn
+	-- the last gem/reroll, and never re-roll a protected value.
+	local plotted = plottedKeys()
 	local units = unitEntries()
-	table.sort(units, function(a, b) return a.income > b.income end)
-	for _, u in ipairs(units) do
-		if Cfg.enabled.autoGrade and gems >= 1 then
-			local g = Grades and u.attrs.grade and Grades[u.attrs.grade]
-			local mult = (g and tonumber(g.incomeMultiplier)) or 1
-			if mult < Cfg.gradeTarget then
-				R.GradeRoll:FireServer(u.key, false)
-				gems = gems - 1
+	table.sort(units, function(a, b)
+		local ap, bp = plotted[a.key] and 1 or 0, plotted[b.key] and 1 or 0
+		if ap ~= bp then return ap > bp end
+		return a.income > b.income
+	end)
+	local pg = protectedSet("ProtectedGrades")
+	local pt = protectedSet("ProtectedTraits")
+	for i, u in ipairs(units) do
+		if i > math.max(8, C.keepTop:Get() or 8) and not plotted[u.key] then break end
+		if u.attrs.locked then continue end
+		if wantGrade and gems >= 2 then
+			local cur = u.attrs.grade
+			local isProt = cur and pg[cur] and pv(pg[cur]) == true
+			if not isProt and gradeMultOf(u) < (C.gradeTarget:Get() or 3) then
+				if R.GradeRoll then R.GradeRoll:FireServer(u.key, false) end
 				return true
 			end
 		end
-		if Cfg.enabled.autoTrait and rerolls >= 1 then
-			local t = Traits and u.attrs.trait and Traits[u.attrs.trait]
-			local mult = (t and tonumber(t.incomeMultiplier)) or 0
-			if mult < Cfg.traitTarget then
-				R.TraitRoll:FireServer(u.key, false)
-				rerolls = rerolls - 1
+		if wantTrait and rerolls >= 2 then
+			local cur = u.attrs.trait
+			local isProt = cur and pt[cur] and pv(pt[cur]) == true
+			if not isProt and traitMultOf(u) < (C.traitTarget:Get() or 2) then
+				if R.TraitRoll then R.TraitRoll:FireServer(u.key, false) end
 				return true
 			end
 		end
@@ -591,11 +912,95 @@ function A.gradeTrait()
 	return false
 end
 
+function A.quirks()
+	if not (Quirks and R.QuirkRoll) then return false end
+	if not (C.autoQuirk and C.autoQuirk:Get()) then return false end
+	local plotted = plottedKeys()
+	local units = unitEntries()
+	table.sort(units, function(a, b) return a.income > b.income end)
+	local top, stopOrder = {}, C.quirkOrder:Get() or 11
+	local wantN = C.quirkUnits:Get() or 3
+	for _, u in ipairs(units) do
+		if plotted[u.key] then
+			table.insert(top, u)
+			if #top >= wantN then break end
+		end
+	end
+	if #top == 0 then
+		for i = 1, math.min(wantN, #units) do table.insert(top, units[i]) end
+	end
+	local pq = protectedSet("ProtectedQuirks")
+	for _, u in ipairs(top) do
+		if u.attrs.locked then continue end
+		local cur = u.attrs.quirk
+		local isProt = cur and pq[cur] and pv(pq[cur]) == true
+		if not isProt and quirkOrderOf(u) < stopOrder then
+			local cost = (QuirkUtil and tonumber(pv(QuirkUtil.GetRollCost, u.name, u.attrs)))
+			local reserve = tonumber(C.moneyReserve:Get()) or 0
+			if cost and money() - cost < reserve then return false end
+			R.QuirkRoll:FireServer(u.key)
+			return true
+		end
+	end
+	return false
+end
+
+function A.protectDrops()
+	local did = 0
+	local function ensure(remote, setName, cur, good)
+		if not (remote and cur and good) then return end
+		local set = protectedSet(setName)
+		local g = set[cur]
+		if g and pv(g) == true then return end
+		remote:FireServer(cur, true)
+		did = did + 1
+	end
+	local plotted = plottedKeys()
+	for _, u in ipairs(unitEntries()) do
+		if plotted[u.key] or (u.attrs.locked) then
+			if gradeMultOf(u) >= (C.gradeTarget:Get() or 3) then
+				ensure(R.GradeProtect, "ProtectedGrades", u.attrs.grade, true)
+			end
+			if traitMultOf(u) >= (C.traitTarget:Get() or 2) then
+				ensure(R.TraitProtect, "ProtectedTraits", u.attrs.trait, true)
+			end
+			if Quirks and u.attrs.quirk and quirkOrderOf(u) >= (C.quirkOrder:Get() or 11) then
+				ensure(R.QuirkProtect, "ProtectedQuirks", u.attrs.quirk, true)
+			end
+		end
+	end
+	if did > 0 then log("protected " .. did .. " good drop(s)") end
+	return did
+end
+
+function A.autoLock()
+	if not R.UnitSetLocked then return 0 end
+	if os.clock() - (State.lastLock or 0) < 10 then return 0 end
+	local threshold = C.sellChance:Get() or 1000
+	local plotted = plottedKeys()
+	local map = {}
+	for _, u in ipairs(unitEntries()) do
+		if not u.attrs.locked and (plotted[u.key] or u.chance >= threshold or (u.attrs.mutation and C.keepMutated:Get())) then
+			map[u.key] = true
+		end
+	end
+	if next(map) == nil then return 0 end
+	State.lastLock = os.clock()
+	R.UnitSetLocked:FireServer(map)
+	local n = 0
+	for _ in pairs(map) do n = n + 1 end
+	log("locked " .. n .. " rare unit(s)")
+	return n
+end
+
 function A.dice()
 	if not (DiceCfg and R.BuyDice) then return end
 	local all = pv(DiceCfg.GetAll) or {}
 	local owned = pv(function() return D.OwnedDice() end) or {}
-	local cash = money()
+	local reserve = tonumber(C.moneyReserve:Get()) or 0
+	local cash = money() - reserve
+	if cash < 0 then cash = 0 end
+	local frac = C.diceSpendFrac:Get() or 0.5
 	local bestOwned, bestLuck = nil, -1
 	local bestBuy, bestBuyLuck = nil, -1
 	for name, cfg in pairs(all) do
@@ -604,7 +1009,7 @@ function A.dice()
 			if luck > bestLuck then bestLuck, bestOwned = luck, name end
 		else
 			local price = tonumber(cfg.price)
-			if price and price <= cash * Cfg.diceSpendFrac and luck > bestBuyLuck then
+			if price and price <= cash * frac and luck > bestBuyLuck then
 				bestBuyLuck, bestBuy = luck, name
 			end
 		end
@@ -620,6 +1025,21 @@ function A.dice()
 		R.EquipDice:FireServer(bestOwned)
 		log("equipped dice " .. bestOwned .. " (luck x" .. tostring(bestLuck) .. ")")
 	end
+end
+
+function A.gear()
+	if not R.GearEquip then return false end
+	if os.clock() - (State.lastGear or 0) < 15 then return false end
+	for _, e in pairs(inventory()) do
+		local cfg = ER.getEntryConfig(e.name)
+		if cfg and cfg.kind == "Gear" and cfg.slot then
+			State.lastGear = os.clock()
+			R.GearEquip:FireServer(cfg.slot, e.name)
+			log("equipped gear " .. tostring(e.name))
+			return true
+		end
+	end
+	return false
 end
 
 function A.boostSpins()
@@ -640,134 +1060,251 @@ function A.boostSpins()
 	return done
 end
 
-function A.rebirth()
-	if not (Rebirths and R.Rebirth) then return end
-	local cur = tonumber(pv(function() return D.Rebirth() end)) or 0
-	local next_ = pv(Rebirths.GetNext, cur)
-	if next_ and money() >= (tonumber(next_.cost) or math.huge) then
-		R.Rebirth:FireServer()
-		log("REBIRTH -> " .. tostring(cur + 1) .. "  (luck x" .. tostring(next_.luckMultiplier) .. ")", Color3.fromRGB(255, 205, 90))
-	end
-end
-
-function A.fuse()
-	if State.fuseActive or not R.Fuse then return end
-	local plotted = plottedKeys()
-	local units = unitEntries()
-	if #units < Cfg.fuseFloorUnits then return end
-	table.sort(units, function(a, b) return a.income > b.income end)
-	local pool = {}
-	for i, u in ipairs(units) do
-		if i > Cfg.keepTop and u.amount == 1 and not u.cfg.limited and not u.attrs.locked
-			and not plotted[u.key] and u.chance <= Cfg.fuseMaxChance then
-			table.insert(pool, u)
-		end
-	end
-	if #pool < 3 then return end
-	table.sort(pool, function(a, b) return a.income < b.income end)
-	local a1, a2, a3 = pool[1], pool[2], pool[3]
-	local cost = (FusingCfg and FusingCfg.GetCost(a1.chance + a2.chance + a3.chance)) or math.huge
-	if money() < math.max(Cfg.fuseMinMoney, cost * Cfg.fuseMoneyMultiple) then return end
-	State.fuseActive = true
-	State.lastFuse = { a1.name, a2.name, a3.name }
-	R.Fuse:FireServer(a1.key, a2.key, a3.key)
-	task.delay(5, function() State.fuseActive = false end)
-end
-
-if R.FuseResult then
-	State.fuseConn = R.FuseResult.OnClientEvent:Connect(function(unit, err)
-		if err ~= nil then
-			local msg = tostring(err)
-			local colour = Color3.fromRGB(255, 120, 120)
-			if string.find(msg, "Please wait", 1, true) then
-				colour = Color3.fromRGB(150, 150, 160)
-			end
-			log("fuse: " .. msg, colour)
-			return
-		end
-		if typeof(unit) ~= "table" then return end
-		local cfg = ER.getEntryConfig(unit.name)
-		local ch = cfg and chanceOf(cfg, unit.attributes) or 0
-		local label = tostring(unit.name)
-		if unit.attributes and unit.attributes.mutation then
-			label = tostring(unit.attributes.mutation) .. " " .. label
-		end
-		local consumed = State.lastFuse and table.concat(State.lastFuse, " + ") or "3 units"
-		log(string.format("FUSED %s -> %s  (1 in %s)", consumed, label, fmt(ch)), Color3.fromRGB(255, 200, 120))
-	end)
-end
-function A.tower()
-	if not (TowersCfg and R.TowerPlay) then return end
-	if State.towerActive then
-		local res = R.TowerFloor:InvokeServer()
-		if res == nil then
-			State.towerStalls = State.towerStalls + 1
-			if State.towerStalls >= 5 then
-				R.TowerCancel:InvokeServer()
-				State.towerActive = false
-				State.towerStalls = 0
-				State.towerCooldown = os.clock() + 8
-			end
-		else
-			State.towerStalls = 0
-		end
-		return
-	end
-	if (State.towerCooldown or 0) > os.clock() then return end
-	local team = pv(function() return D.TowerTeam() end)
-	local hasTeam = false
-	if typeof(team) == "table" then
-		for _, v in pairs(team) do
-			if v then hasTeam = true break end
-		end
-	end
-	if not hasTeam then
-		if R.TowerEquipBest then R.TowerEquipBest:FireServer() end
-		State.towerCooldown = os.clock() + 3
-		return
-	end
-	local name = Cfg.towerName
-	if not name then
-		local all = pv(TowersCfg.GetAll)
-		local best, order = nil, -1
-		if typeof(all) == "table" then
-			for tname, tcfg in pairs(all) do
-				local o = tonumber(tcfg.order) or 0
-				if o > order then order, best = o, tname end
-			end
-		end
-		name = best
-	end
-	if not name then return end
-	if R.TowerPlay:InvokeServer(name) then
-		State.towerActive = true
-		State.towerStalls = 0
-		log("tower started: " .. name, Color3.fromRGB(255, 180, 120))
-	end
-end
-
-function A.redeem(silent)
-	if not (MonetCfg and MonetCfg.Codes and R.Redeem) then return 0 end
-	local done = pv(function() return D.RedeemedCodes() end) or {}
+function A.redeem()
+	if State.redeemDone then return 0 end
+	if not (CodesCfg and R.Redeem) then State.redeemDone = true return 0 end
+	local doneMap = pv(function() return D.RedeemedCodes() end) or {}
 	local n = 0
-	for code in pairs(MonetCfg.Codes) do
-		if not done[code] then
+	for code in pairs(CodesCfg) do
+		if not doneMap[code] then
 			R.Redeem:FireServer(code)
 			n = n + 1
 			task.wait(0.6)
 		end
 	end
-	if n > 0 and not silent then
-		log("redeemed " .. n .. " code(s)", Color3.fromRGB(180, 255, 140))
-	end
+	State.redeemDone = true
+	if n > 0 then log("redeemed " .. n .. " code(s)") end
 	return n
 end
--- scheduler (Heartbeat driven: every action is a cheap state check, real work
--- runs in its own thread so a blocking InvokeServer never stalls the frame) ---
+
+function A.rebirth()
+	if not (Rebirths and R.Rebirth) then return false end
+	local cur = tonumber(pv(function() return D.Rebirth() end)) or 0
+	local next_ = pv(Rebirths.GetNext, cur)
+	if typeof(next_) ~= "table" then return false end
+	local cost = tonumber(next_.cost) or math.huge
+	if money() >= cost then
+		R.Rebirth:FireServer()
+		log("REBIRTH -> " .. tostring(cur + 1) .. " (luck x" .. tostring(next_.luckMultiplier)
+			.. ", money x" .. tostring(next_.moneyMultiplier) .. ")")
+		return true
+	end
+	return false
+end
+
+function A.fuse()
+	if State.fuseActive or not R.Fuse then return false end
+	local minMoney = tonumber(C.fuseMinMoney:Get()) or 0
+	if money() < minMoney then return false end
+	local threshold = C.sellChance:Get() or 1000
+	local pool = {}
+	for _, u in ipairs(unitEntries()) do
+		if not u.cfg.limited and u.amount == 1 and not u.attrs.locked and u.chance < threshold then
+			table.insert(pool, u)
+		end
+	end
+	table.sort(pool, function(a, b) return a.chance < b.chance end)
+	if #pool < 3 then return false end
+	State.fuseActive = true
+	R.Fuse:FireServer(pool[1].key, pool[2].key, pool[3].key)
+	log("fused 3 commons")
+	task.delay(4, function() State.fuseActive = false end)
+	return true
+end
+
+local TOWER_ENDED = (TowerRefs and TowerRefs.Actions and TowerRefs.Actions.ended) or "ended"
+
+local function towerOrder()
+	local order = {}
+	if not (TowersCfg and TowersCfg.GetAll) then return order end
+	local all = pv(TowersCfg.GetAll)
+	if typeof(all) ~= "table" then return order end
+	for tname in pairs(all) do
+		table.insert(order, tname)
+	end
+	table.sort(order, function(a, b)
+		return (tonumber(all[a].order) or 0) > (tonumber(all[b].order) or 0)
+	end)
+	return order
+end
+
+function A.tower()
+	-- Game-side auto-tower (SetAutoTower): the server plays floors itself, so we
+	-- only keep the target tower selected and stay out of the way.
+	if R.TowerSetAuto and C.towerGameAuto and C.towerGameAuto:Get() then
+		local order = towerOrder()
+		if #order == 0 then return false end
+		local pick = (C.towerName and C.towerName:Get()) or order[1]
+		local valid = false
+		for _, n in ipairs(order) do if n == pick then valid = true break end end
+		if not valid then pick = order[1] end
+		if State.towerAutoSet ~= pick then
+			local team = pv(function() return D.TowerTeam() end)
+			local hasTeam = false
+			if typeof(team) == "table" then
+				for _, v in pairs(team) do if v and v ~= "" then hasTeam = true break end end
+			end
+			if not hasTeam then
+				if R.TowerEquipBest then R.TowerEquipBest:FireServer() end
+				log("tower: no team set, equipping best team")
+				return false
+			end
+			R.TowerSetAuto:FireServer(pick)
+			State.towerAutoSet = pick
+			State.towerCurrent = pick
+			log("tower auto enabled (game-side): " .. tostring(pick))
+		end
+		return true
+	end
+	State.towerAutoSet = nil
+	if not (TowersCfg and R.TowerPlay) then return false end
+	local now = os.clock()
+
+	if State.towerActive then
+		local ok, events = pcall(R.TowerFloor.InvokeServer, R.TowerFloor)
+		local ended, got = false, false
+		if ok and typeof(events) == "table" then
+			got = #events > 0
+			for _, ev in ipairs(events) do
+				if typeof(ev) == "table" and ev.action == TOWER_ENDED then
+					ended = true
+				end
+			end
+		end
+		if ended then
+			State.towerActive = false
+			State.towerStalls = 0
+			State.towerFail = 0
+			State.towerCooldown = now + (C.towerInterval:Get() or 10)
+			log("tower run ended: " .. tostring(State.towerCurrent))
+			return true
+		end
+		if got then
+			State.towerStalls = 0
+			return true
+		end
+		State.towerStalls = (State.towerStalls or 0) + 1
+		if State.towerStalls >= 3 then
+			State.towerActive = false
+			State.towerStalls = 0
+			State.towerFail = (State.towerFail or 0) + 1
+			State.towerCooldown = now + (C.towerInterval:Get() or 10) * 3
+			if R.TowerCancel then pcall(R.TowerCancel.InvokeServer, R.TowerCancel) end
+			local idx = State.towerIdx or 1
+			if State.towerFail >= 2 and State.towerOrder and idx < #State.towerOrder then
+				State.towerIdx = idx + 1
+				State.towerFail = 0
+				log("tower struggles on " .. tostring(State.towerCurrent)
+					.. " - switching to " .. State.towerOrder[idx + 1])
+			else
+				log("tower stalled on " .. tostring(State.towerCurrent) .. " - retrying later")
+			end
+		end
+		return true
+	end
+
+	if now < (State.towerCooldown or 0) then return false end
+
+	local team = pv(function() return D.TowerTeam() end)
+	local hasTeam = false
+	if typeof(team) == "table" then
+		for _, v in pairs(team) do
+			if v and v ~= "" then
+				hasTeam = true
+				break
+			end
+		end
+	end
+	if not hasTeam then
+		if R.TowerEquipBest then R.TowerEquipBest:FireServer() end
+		State.towerCooldown = now + 4
+		log("tower: no team set, equipping best team")
+		return false
+	end
+
+	local order = towerOrder()
+	if #order == 0 then return false end
+	State.towerOrder = order
+
+	local pick = C.towerName and C.towerName:Get() or nil
+	if pick ~= State.lastTowerPick then
+		State.lastTowerPick = pick
+		State.towerIdx = nil
+	end
+	if State.towerIdx == nil then
+		State.towerIdx = 1
+		if typeof(pick) == "string" then
+			for i, n in ipairs(order) do
+				if n == pick then State.towerIdx = i end
+			end
+		end
+	end
+	local name = order[State.towerIdx] or order[1]
+	State.towerCurrent = name
+
+	local ok, res = pcall(R.TowerPlay.InvokeServer, R.TowerPlay, name)
+	if ok and res then
+		State.towerActive = true
+		State.towerStalls = 0
+		log("tower started: " .. name)
+		return true
+	end
+	-- PlayTower can refuse because a run is still live server-side (e.g. after a
+	-- script reload). Try to adopt it instead of waiting forever.
+	local okF, events = pcall(R.TowerFloor.InvokeServer, R.TowerFloor)
+	if okF and typeof(events) == "table" and #events > 0 then
+		State.towerActive = true
+		State.towerStalls = 0
+		log("tower run adopted: " .. tostring(State.towerCurrent))
+		return true
+	end
+	State.towerCooldown = now + 8
+	return false
+end
+
+-- scheduler ------------------------------------------------------------------
+-- Heartbeat driven: every entry is a cheap gate check; real work runs in its
+-- own thread so a blocking InvokeServer never stalls the frame.
 local Tasks = {}
 local function register(name, interval, fn, gate)
 	Tasks[name] = { interval = interval, fn = fn, gate = gate, last = 0, running = false }
 end
+
+local function gateOpen(gate)
+	if gate == nil then return true end
+	if typeof(gate) == "function" then return gate() and true or false end
+	local c = C[gate]
+	return c ~= nil and c:Get() == true
+end
+
+register("roll", function() return 0.4 end, A.roll, "autoRoll")
+register("collect", function() return C.collectInterval:Get() or 5 end, A.collect, "autoCollect")
+register("sell", function()
+	if #unitEntries() >= inventoryCap() - (C.reserveUnits:Get() or 20) then return 2 end
+	return C.sellInterval:Get() or 8
+end, A.sell, "autoSell")
+register("equipBest", function() return C.equipInterval:Get() or 20 end, A.equipBest, "autoEquipBest")
+register("upgrades", function() return C.upgradeInterval:Get() or 3 end, A.upgrades, "autoUpgrades")
+register("quests", function() return C.questInterval:Get() or 15 end, A.quests, "autoQuests")
+register("questShop", function() return C.questInterval:Get() or 15 end, A.questShop, "autoQuestShop")
+register("claims", function() return C.claimInterval:Get() or 45 end, A.claims, "autoClaims")
+register("gradeTrait", function() return C.gradeInterval:Get() or 0.45 end, A.gradeTrait,
+	function() return C.autoGrade:Get() or C.autoTrait:Get() end)
+register("dice", function() return C.diceInterval:Get() or 30 end, A.dice, "autoDice")
+register("gear", function() return 15 end, A.gear, "autoBoostSpins")
+register("boostSpins", function() return C.boostInterval:Get() or 30 end, A.boostSpins, "autoBoostSpins")
+register("redeem", function() return State.redeemDone and 120 or 5 end, A.redeem, "autoRedeem")
+register("rebirth", function() return C.rebirthInterval:Get() or 10 end, A.rebirth, "autoRebirth")
+register("rebirthStats", function() return C.rebirthInterval:Get() or 10 end, A.rebirthStats, "autoRebirthStats")
+register("levelSlots", function() return C.levelSlotInterval:Get() or 15 end, A.levelSlots, "autoLevelSlots")
+register("quirks", function() return C.gradeInterval:Get() or 0.45 end, A.quirks, "autoQuirk")
+register("protect", function() return 10 end, A.protectDrops, "autoProtectDrops")
+register("autoLock", function() return 10 end, A.autoLock, "autoLock")
+register("fuse", function() return C.fuseInterval:Get() or 20 end, A.fuse, "autoFuse")
+register("tower", function()
+	if State.towerActive then return C.towerFloorInterval:Get() or 1.5 end
+	return C.towerInterval:Get() or 10
+end, A.tower, "autoTower")
 
 local moneySamples, rollSamples = {}, {}
 local function updateStats()
@@ -778,6 +1315,7 @@ local function updateStats()
 		Stats.earned = Stats.earned + (Stats.money - prev)
 	end
 	State.lastMoney = Stats.money
+
 	table.insert(moneySamples, { t = now, m = Stats.earned })
 	while #moneySamples > 2 and now - moneySamples[1].t > 60 do table.remove(moneySamples, 1) end
 	local a, b = moneySamples[1], moneySamples[#moneySamples]
@@ -787,30 +1325,15 @@ local function updateStats()
 	while #rollSamples > 2 and now - rollSamples[1].t > 60 do table.remove(rollSamples, 1) end
 	local ra, rb = rollSamples[1], rollSamples[#rollSamples]
 	if rb.t - ra.t > 5 then Stats.rollsPerMin = (rb.n - ra.n) / (rb.t - ra.t) * 60 end
-end
 
-register("roll",      function() return 0.4 end, function() A.roll() end, "autoRoll")
-register("collect",   function() return Cfg.collectInterval end, A.collect, "autoCollect")
-register("sell",      function() return (#unitEntries() >= inventoryCap() - Cfg.reserveUnits) and 2 or Cfg.sellInterval end, A.sell, "autoSell")
-register("equipBest", 20, A.equipBest, "autoEquipBest")
-register("upgrades",  function() return Cfg.upgradeInterval end, A.upgrades, "autoUpgrades")
-register("quests",    function() return Cfg.questInterval end, A.quests, "autoQuests")
-register("questShop", function() return Cfg.questInterval end, A.questShop, "autoQuestShop")
-register("claims",    function() return Cfg.claimInterval end, A.claims, "autoClaims")
-register("gradeTrait",function() return Cfg.gradeInterval end, A.gradeTrait, function() return Cfg.enabled.autoGrade or Cfg.enabled.autoTrait end)
-register("dice",      function() return Cfg.diceInterval end, A.dice, "autoDice")
-register("boostSpins",30, A.boostSpins, "autoBoostSpins")
-register("redeem",    5, A.redeem, "autoRedeem")
-register("rebirth",   10, A.rebirth, "autoRebirth")
-register("fuse",      function() return Cfg.fuseInterval end, A.fuse, "autoFuse")
-register("tower",     function() return Cfg.towerInterval end, A.tower, "autoTower")
-register("killAutoRoll", 10, function()
-	if pv(function() return D.AutoRoll() end) then
-		R.SetAutoRoll:FireServer(false)
-		log("game AutoRoll switched off", Color3.fromRGB(160, 200, 255))
-	end
-end, "killAutoRoll")
-register("stats",     1, updateStats, nil)
+	if not window.Alive then return end
+	C.badgeMoney:Set("$" .. fmt(Stats.money))
+	C.badgeRolls:Set(string.format("%.1f", Stats.rollsPerMin))
+	C.badgeEarn:Set("$" .. fmt(Stats.moneyPerMin))
+	C.badgeUnits:Set(tostring(#unitEntries()) .. "/" .. tostring(inventoryCap()))
+	refreshLog()
+end
+register("stats", function() return 1 end, updateStats, nil)
 
 local function runTask(name, t)
 	local iv = typeof(t.interval) == "function" and t.interval() or t.interval
@@ -821,476 +1344,63 @@ local function runTask(name, t)
 		local ok, err = pcall(t.fn)
 		t.running = false
 		if not ok then
-			log(name .. ": " .. tostring(err), Color3.fromRGB(255, 120, 120))
+			log(name .. ": " .. tostring(err))
 		end
 	end)
 end
 
 local function schedulerTick()
 	for name, t in pairs(Tasks) do
-		local gate = t.gate
-		local on
-		if gate == nil then
-			on = true
-		elseif typeof(gate) == "function" then
-			on = gate()
-		else
-			on = Cfg.enabled[gate]
-		end
-		if on and not t.running then
+		if gateOpen(t.gate) and not t.running then
 			runTask(name, t)
 		end
 	end
 end
 
-State.scheduler = RunService.Heartbeat:Connect(function()
+window:Give(RunService.Heartbeat:Connect(function()
 	if not State.running then return end
 	local ok, err = pcall(schedulerTick)
 	if not ok then
-		warn("[ADH] scheduler: " .. tostring(err))
+		warn("[ADF] scheduler: " .. tostring(err))
 	end
+end))
+
+window:OnDestroy(function()
+	State.running = false
 end)
--- UI -------------------------------------------------------------------------
-local Theme = {
-	bg     = Color3.fromRGB(16, 16, 20),
-	panel  = Color3.fromRGB(26, 26, 34),
-	row    = Color3.fromRGB(36, 36, 46),
-	accent = Color3.fromRGB(255, 92, 172),
-	text   = Color3.fromRGB(236, 236, 242),
-	dim    = Color3.fromRGB(152, 152, 166),
-	good   = Color3.fromRGB(122, 255, 152),
-	bad    = Color3.fromRGB(255, 118, 118),
+
+-- console handle --------------------------------------------------------------
+local function killSwitch()
+	State.running = false
+	for _, t in ipairs(allToggles) do
+		t:Set(false)
+	end
+	-- also switch off any game-side automation we enabled
+	if R.SetAutoRoll then pcall(R.SetAutoRoll.FireServer, R.SetAutoRoll, false) end
+	if R.UpdateAutoSell and C.mirrorAutoSell and C.mirrorAutoSell:Get() then
+		pcall(R.UpdateAutoSell.FireServer, R.UpdateAutoSell, 0)
+	end
+	if R.TowerSetAuto and State.towerAutoSet then
+		pcall(R.TowerSetAuto.FireServer, R.TowerSetAuto, false)
+		State.towerAutoSet = nil
+	end
+end
+getgenv().__ANIME_DICE_AUTOFARM = {
+	stop = killSwitch,
+	stats = Stats,
+	state = State,
+	controls = C,
+	window = window,
 }
 
-local function new(class, props, parent)
-	local o = Instance.new(class)
-	for k, v in pairs(props) do
-		o[k] = v
-	end
-	o.Parent = parent
-	return o
-end
-
-local playerGui = plr:WaitForChild("PlayerGui")
-local stale = playerGui:FindFirstChild("AnimeDiceHub")
-if stale then stale:Destroy() end
-
-local gui = new("ScreenGui", {
-	Name = "AnimeDiceHub", ResetOnSpawn = false,
-	ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 999,
-}, playerGui)
-
-local main = new("Frame", {
-	Name = "Main", Size = UDim2.new(0, 334, 0, 476),
-	Position = UDim2.new(0, 18, 0.5, -238), BackgroundColor3 = Theme.bg,
-	BorderSizePixel = 0, Active = true,
-}, gui)
-new("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
-new("UIStroke", { Color = Theme.accent, Transparency = 0.55, Thickness = 1 }, main)
-
-local header = new("Frame", {
-	Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = Theme.panel, BorderSizePixel = 0,
-}, main)
-new("UICorner", { CornerRadius = UDim.new(0, 10) }, header)
-new("TextLabel", {
-	Size = UDim2.new(1, -180, 1, 0), Position = UDim2.new(0, 10, 0, 0),
-	BackgroundTransparency = 1, Text = "ANIME DICE HUB  v" .. HUB_VER,
-	Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = Theme.accent,
-	TextXAlignment = Enum.TextXAlignment.Left,
-}, header)
-local closeBtn = new("TextButton", {
-	Size = UDim2.new(0, 24, 0, 22), Position = UDim2.new(1, -30, 0, 6),
-	BackgroundColor3 = Theme.bad, Text = "X", Font = Enum.Font.GothamBold,
-	TextSize = 12, TextColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0,
-}, header)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, closeBtn)
-local stopBtn = new("TextButton", {
-	Size = UDim2.new(0, 66, 0, 22), Position = UDim2.new(1, -102, 0, 6),
-	BackgroundColor3 = Theme.accent, Text = "STOP ALL", Font = Enum.Font.GothamBold,
-	TextSize = 10, TextColor3 = Color3.new(0, 0, 0), BorderSizePixel = 0,
-}, header)
-new("UICorner", { CornerRadius = UDim.new(0, 6) }, stopBtn)
-
-local statsLabel = new("TextLabel", {
-	Size = UDim2.new(1, -16, 0, 78), Position = UDim2.new(0, 8, 0, 40),
-	BackgroundColor3 = Theme.panel, BorderSizePixel = 0, Text = "", Font = Enum.Font.Code,
-	TextSize = 12, TextColor3 = Theme.text, TextXAlignment = Enum.TextXAlignment.Left,
-	TextYAlignment = Enum.TextYAlignment.Top,
-}, main)
-new("UICorner", { CornerRadius = UDim.new(0, 8) }, statsLabel)
-new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingTop = UDim.new(0, 5) }, statsLabel)
-
-local scroll = new("ScrollingFrame", {
-	Size = UDim2.new(1, -16, 1, -246), Position = UDim2.new(0, 8, 0, 124),
-	BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.new(0, 0, 0, 0),
-	AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
-	ScrollBarThickness = 5, ScrollBarImageColor3 = Theme.accent,
-}, main)
-new("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, scroll)
-new("UIPadding", { PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6) }, scroll)
-
-local logLabel = new("TextLabel", {
-	Size = UDim2.new(1, -16, 0, 100), Position = UDim2.new(0, 8, 1, -118),
-	BackgroundColor3 = Theme.panel, BorderSizePixel = 0, Text = "", Font = Enum.Font.Code,
-	TextSize = 11, TextColor3 = Theme.dim, TextXAlignment = Enum.TextXAlignment.Left,
-	TextYAlignment = Enum.TextYAlignment.Top, RichText = true,
-}, main)
-new("UICorner", { CornerRadius = UDim.new(0, 8) }, logLabel)
-new("UIPadding", { PaddingLeft = UDim.new(0, 7), PaddingTop = UDim.new(0, 4) }, logLabel)
-
-new("TextLabel", {
-	Size = UDim2.new(1, -16, 0, 12), Position = UDim2.new(0, 8, 1, -16),
-	BackgroundTransparency = 1, Text = "made with Project UAI  ·  model deepseek-v4-flash",
-	Font = Enum.Font.Gotham, TextSize = 9, TextColor3 = Theme.dim,
-	TextXAlignment = Enum.TextXAlignment.Center,
-}, main)
-
-local order = 0
-local function nextOrder()
-	order = order + 1
-	return order
-end
-
-local refreshers = {}
-
-local function toggleRow(key, label)
-	local row = new("TextButton", {
-		Size = UDim2.new(1, 0, 0, 24), BackgroundColor3 = Theme.row, Text = "",
-		AutoButtonColor = true, BorderSizePixel = 0, LayoutOrder = nextOrder(),
-	}, scroll)
-	new("UICorner", { CornerRadius = UDim.new(0, 6) }, row)
-	new("TextLabel", {
-		Size = UDim2.new(1, -70, 1, 0), Position = UDim2.new(0, 8, 0, 0), BackgroundTransparency = 1,
-		Text = label, Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = Theme.text,
-		TextXAlignment = Enum.TextXAlignment.Left,
-	}, row)
-	local state = new("TextLabel", {
-		Size = UDim2.new(0, 54, 1, 0), Position = UDim2.new(1, -58, 0, 0), BackgroundTransparency = 1,
-		Text = "", Font = Enum.Font.GothamBold, TextSize = 12,
-		TextXAlignment = Enum.TextXAlignment.Right,
-	}, row)
-	local function refresh()
-		local on = Cfg.enabled[key]
-		state.Text = on and "ON" or "OFF"
-		state.TextColor3 = on and Theme.good or Theme.bad
-		row.BackgroundColor3 = on and Color3.fromRGB(30, 48, 36) or Theme.row
-	end
-	row.MouseButton1Click:Connect(function()
-		Cfg.enabled[key] = not Cfg.enabled[key]
-		refresh()
-		if key == "serverAutoSell" and R.SetSetting then
-			R.SetSetting:FireServer("AutoSell", Cfg.enabled[key] and Cfg.serverAutoSellValue or 0)
-			log("server AutoSell = " .. tostring(Cfg.enabled[key] and Cfg.serverAutoSellValue or 0))
-		end
-	end)
-	refresh()
-	refreshers[key] = refresh
-	return row
-end
-
-local function numberRow(cfgKey, label, suffix)
-	local row = new("Frame", {
-		Size = UDim2.new(1, 0, 0, 24), BackgroundColor3 = Theme.row,
-		BorderSizePixel = 0, LayoutOrder = nextOrder(),
-	}, scroll)
-	new("UICorner", { CornerRadius = UDim.new(0, 6) }, row)
-	new("TextLabel", {
-		Size = UDim2.new(1, -100, 1, 0), Position = UDim2.new(0, 8, 0, 0), BackgroundTransparency = 1,
-		Text = label .. (suffix and ("  (" .. suffix .. ")") or ""), Font = Enum.Font.Gotham,
-		TextSize = 12, TextColor3 = Theme.dim, TextXAlignment = Enum.TextXAlignment.Left,
-	}, row)
-	local box = new("TextBox", {
-		Size = UDim2.new(0, 84, 0, 18), Position = UDim2.new(1, -92, 0, 3),
-		BackgroundColor3 = Theme.panel, Text = tostring(Cfg[cfgKey]), Font = Enum.Font.Code,
-		TextSize = 12, TextColor3 = Theme.text, ClearTextOnFocus = false,
-		TextXAlignment = Enum.TextXAlignment.Center, BorderSizePixel = 0,
-	}, row)
-	new("UICorner", { CornerRadius = UDim.new(0, 5) }, box)
-	box.FocusLost:Connect(function()
-		local n = tonumber(box.Text)
-		if n then
-			Cfg[cfgKey] = n
-			box.Text = tostring(n)
-			if cfgKey == "serverAutoSellValue" and Cfg.enabled.serverAutoSell and R.SetSetting then
-				R.SetSetting:FireServer("AutoSell", n)
-			end
-			log(cfgKey .. " = " .. tostring(n))
-		else
-			box.Text = tostring(Cfg[cfgKey])
-		end
-	end)
-	return row
-end
-
-local function buttonRow(label, colour, fn)
-	local row = new("TextButton", {
-		Size = UDim2.new(1, 0, 0, 26), BackgroundColor3 = colour, Text = label,
-		Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Color3.new(0, 0, 0),
-		BorderSizePixel = 0, LayoutOrder = nextOrder(),
-	}, scroll)
-	new("UICorner", { CornerRadius = UDim.new(0, 6) }, row)
-	row.MouseButton1Click:Connect(function()
-		task.spawn(function()
-			local ok, err = pcall(fn)
-			if not ok then log("action failed: " .. tostring(err), Theme.bad) end
-		end)
-	end)
-	return row
-end
--- roll-showcase suppressor --------------------------------------------------
--- The rare-roll showcase is client-only (RollCutscene): it parents a ScreenGui
--- named "CutsceneBlackFade", clones Assets/.../CameraModel + lines into Workspace,
--- anchors your character, sets the camera to Scriptable and drives it from
--- CamPart, then reveals a "1 in X" counter behind black bars for ~5s.
--- This kills that, and only that: the dice roll animation / roll UI are untouched,
--- and nothing here talks to the server.
-local function killShowcase()
-	for _, g in ipairs(playerGui:GetChildren()) do
-		if g:IsA("ScreenGui") and g.Name ~= "AnimeDiceHub" and string.find(g.Name, "Cutscene", 1, true) then
-			pcall(function() g:Destroy() end)
-		end
-	end
-
-	local cut = UIRefs and UIRefs.Root and UIRefs.Root:FindFirstChild("Cutscene")
-	if cut then
-		for _, c in ipairs(cut:GetChildren()) do
-			if c:IsA("GuiObject") then c.Visible = false end
-		end
-	end
-
-	for _, m in ipairs(workspace:GetChildren()) do
-		if m.Name == "CameraModel" or m.Name == "lines" then
-			for _, d in ipairs(m:GetDescendants()) do
-				if d.Name == "CamPart" then pcall(function() d:Destroy() end) end
-			end
-			if m.Name == "lines" then pcall(function() m:Destroy() end) end
-		end
-	end
-
-	local cam = workspace.CurrentCamera
-	local char = plr.Character
-	if char then
-		local hrp = char:FindFirstChild("HumanoidRootPart")
-		if hrp then hrp.Anchored = false end
-		for _, d in ipairs(char:GetDescendants()) do
-			if d:IsA("BasePart") then d.LocalTransparencyModifier = 0 end
-		end
-	end
-	if cam then
-		local hum = char and char:FindFirstChildOfClass("Humanoid")
-		if cam.CameraType == Enum.CameraType.Scriptable then
-			cam.CameraType = Enum.CameraType.Custom
-		end
-		if hum then cam.CameraSubject = hum end
-	end
-end
-
-State.cutsceneConn = playerGui.DescendantAdded:Connect(function(inst)
-	if not Cfg.enabled.killShowcase then return end
-	if not inst:IsA("ScreenGui") then return end
-	local isCutscene = inst.Name == "CutsceneBlackFade"
-	if isCutscene then
-		State.suppressUntil = os.clock() + 6
-	end
-	if isCutscene or os.clock() < (State.suppressUntil or 0) then
-		pcall(function() inst:Destroy() end)
-		if isCutscene then
-			-- the showcase sets Scriptable ~0.5s in, so sweep the whole window
-			task.spawn(killShowcase)
-			for _, d in ipairs({ 0.35, 0.7, 1.2, 2.5, 4.2 }) do
-				task.delay(d, killShowcase)
-			end
-			if os.clock() - (State.lastShowcaseLog or 0) > 5 then
-				State.lastShowcaseLog = os.clock()
-				log("roll showcase suppressed", Color3.fromRGB(160, 200, 255))
-			end
-		end
-	end
-end)
-
--- clear one that is already mid-flight when the hub loads
-task.spawn(function()
-	if Cfg.enabled.killShowcase then pcall(killShowcase) end
-end)
-toggleRow("autoRoll", "Auto Roll")
-toggleRow("autoSell", "Auto Sell Junk")
-toggleRow("autoCollect", "Auto Collect Plot")
-toggleRow("autoEquipBest", "Auto Equip Best")
-toggleRow("autoUpgrades", "Auto Buy Upgrades")
-toggleRow("autoDice", "Auto Dice (buy / equip best)")
-toggleRow("autoQuests", "Auto Claim Quests")
-toggleRow("autoQuestShop", "Auto Spend Tickets")
-toggleRow("autoClaims", "Auto Daily / Group / Offline")
-toggleRow("autoGrade", "Auto Grade  (1 Gem)")
-toggleRow("autoTrait", "Auto Trait  (1 Reroll)")
-toggleRow("autoBoostSpins", "Auto Use Boosts / Spins")
-toggleRow("autoRedeem", "Auto Redeem Codes")
-toggleRow("autoRebirth", "Auto Rebirth")
-toggleRow("autoTower", "Auto Tower")
-toggleRow("autoFuse", "Auto Fuse Junk -> Rare")
-toggleRow("killShowcase", "Kill Roll Showcase")
-toggleRow("killAutoRoll", "Kill In-Game AutoRoll")
-toggleRow("serverAutoSell", "Server AutoSell (profile)")
-
-numberRow("rollInterval", "Roll interval", "s")
-numberRow("collectInterval", "Collect interval", "s")
-numberRow("sellInterval", "Sell interval", "s")
-numberRow("sellChance", "Sell below 1-in-X", "chance")
-numberRow("keepTop", "Keep best units", "count")
-numberRow("maxUnits", "Sell above N units", "count")
-numberRow("reserveUnits", "Free space reserve", "count")
-numberRow("fuseMaxChance", "Fuse below 1-in-X", "chance")
-numberRow("gradeTarget", "Grade target", "income x")
-numberRow("traitTarget", "Trait target", "income x")
-numberRow("serverAutoSellValue", "Server AutoSell value", "1-in-X")
-
-buttonRow("SELL JUNK NOW", Theme.accent, function() A.sell() end)
-buttonRow("COLLECT NOW", Color3.fromRGB(150, 220, 255), function()
-	local n = A.collect()
-	log("collected " .. tostring(n) .. " slot(s)", Color3.fromRGB(150, 220, 255))
-end)
-buttonRow("EQUIP BEST + TOWER TEAM", Color3.fromRGB(180, 255, 160), function() A.equipBest() end)
-buttonRow("CLAIM QUESTS + REWARDS", Color3.fromRGB(255, 220, 140), function()
-	A.quests()
-	A.claims()
-end)
-buttonRow("REDEEM ALL CODES", Color3.fromRGB(200, 180, 255), function() A.redeem() end)
-buttonRow("USE BOOSTS / SPINS", Color3.fromRGB(255, 170, 200), function() A.boostSpins() end)
-buttonRow("FUSE 3 COMMONS", Color3.fromRGB(255, 200, 120), function() A.fuse() end)
-
--- live UI refresh ------------------------------------------------------------
-local function hex(c)
-	return string.format("#%02X%02X%02X", math.floor(c.R * 255), math.floor(c.G * 255), math.floor(c.B * 255))
-end
-
-local uiAcc = 0
-State.uiConn = RunService.Heartbeat:Connect(function(dt)
-	if not State.running then return end
-	local ok, err = pcall(function()
-	uiAcc = uiAcc + dt
-	if uiAcc < 0.5 then return end
-	uiAcc = 0
-
-	local units, gems, rerolls, tickets, invCount = 0, 0, 0, 0, 0
-	for _, e in pairs(inventory()) do
-		invCount = invCount + 1
-		if e.name == "Gems" then gems = gems + (tonumber(e.amount) or 0)
-		elseif e.name == "Trait Reroll" then rerolls = rerolls + (tonumber(e.amount) or 0)
-		elseif e.name == "Tickets" then tickets = tickets + (tonumber(e.amount) or 0)
-		else
-			local cfg = ER.getEntryConfig(e.name)
-			if cfg and cfg.kind == "Unit" then units = units + 1 end
-		end
-	end
-
-	statsLabel.Text = table.concat({
-		string.format("Money    %-9s  +%s/min", fmt(Stats.money), fmt(Stats.moneyPerMin)),
-		string.format("Rolls    %-9d  %.0f/min   sold %d (%s)", Stats.rolls, Stats.rollsPerMin, Stats.soldUnits, fmt(Stats.soldMoney)),
-		string.format("Units    %d/%d   rebirth %s   dice %s", units, inventoryCap(),
-			tostring(pv(function() return D.Rebirth() end)), tostring(pv(function() return D.Dice() end))),
-		string.format("Buffs    Luck x%s  Money x%s  Roll %ss", tostring(buff("Luck")), tostring(buff("Money Multiplier")), tostring(buff("Roll Duration"))),
-		string.format("Gems %-6d Rerolls %-6d Tickets %-6d", gems, rerolls, tickets),
-		string.format("Rares: %s", #Stats.rares > 0 and Stats.rares[1] or "-"),
-	}, "\n")
-
-	local lines = {}
-	for i = 1, math.min(7, #Stats.log) do
-		local e = Stats.log[i]
-		table.insert(lines, "<font color='" .. hex(e.colour) .. "'>" .. e.text .. "</font>")
-	end
-	logLabel.Text = table.concat(lines, "\n")
-	end)
-	if not ok then warn("[ADH] ui: " .. tostring(err)) end
-end)
-
--- dragging -------------------------------------------------------------------
-local dragging, dragStart, startPos = false, nil, nil
-header.InputBegan:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-		dragging = true
-		dragStart = input.Position
-		startPos = main.Position
-		local conn
-		conn = input.Changed:Connect(function()
-			if input.UserInputState == Enum.UserInputState.End then
-				dragging = false
-				conn:Disconnect()
-			end
-		end)
-	end
-end)
-State.dragConn = UserInputService.InputChanged:Connect(function(input)
-	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-		local d = input.Position - dragStart
-		main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
-	end
-end)
-State.keyConn = UserInputService.InputBegan:Connect(function(input, gpe)
-	if gpe then return end
-	if input.KeyCode == Cfg.uiKey then
-		main.Visible = not main.Visible
-	end
-end)
-closeBtn.MouseButton1Click:Connect(function()
-	main.Visible = false
-end)
-
--- API ------------------------------------------------------------------------
-local API = {}
-API.version = HUB_VER
-API.cfg = Cfg
-API.stats = Stats
-API.actions = A
-API.tasks = Tasks
-
-function API.set(k, v)
-	Cfg[k] = v
-	if refreshers[k] then refreshers[k]() end
-end
-
-function API.toggle(k)
-	Cfg.enabled[k] = not Cfg.enabled[k]
-	if refreshers[k] then refreshers[k]() end
-	if k == "serverAutoSell" and R.SetSetting then
-		R.SetSetting:FireServer("AutoSell", Cfg.enabled[k] and Cfg.serverAutoSellValue or 0)
-	end
-	return Cfg.enabled[k]
-end
-
-API.sellNow = A.sell
-API.collectNow = A.collect
-API.equipBest = A.equipBest
-API.claimNow = A.claims
-API.redeemAll = A.redeem
-API.log = log
-
-function API.stop()
-	getgenv().__ADH_STOP = debug.traceback("[ADH] stop called", 2)
-	State.running = false
-	for _, key in ipairs({ "scheduler", "uiConn", "dragConn", "keyConn", "fuseConn", "cutsceneConn" }) do
-		local c = State[key]
-		if typeof(c) == "RBXScriptConnection" then pcall(function() c:Disconnect() end) end
-		State[key] = nil
-	end
-	if gui then gui:Destroy() end
-	getgenv().__ANIME_DICE_HUB = nil
-	warn("[ADH] stopped")
-end
-
-stopBtn.MouseButton1Click:Connect(function() API.stop() end)
-getgenv().__ANIME_DICE_HUB = API
-
--- startup --------------------------------------------------------------------
-task.spawn(function()
-	log("ANIME DICE HUB v" .. HUB_VER .. " online  ·  Project UAI / deepseek-v4-flash")
-	print(string.format("[ADH] hub loaded: %d tasks, %d remotes", (function() local n = 0 for _ in pairs(Tasks) do n = n + 1 end return n end)(), 33))
-	pcall(A.claims)
-	pcall(A.collect)
-	pcall(A.equipBest)
-	pcall(A.quests)
-	pcall(A.redeem)
-	pcall(A.boostSpins)
-	warn("[ADH] ready - RightShift toggles the UI")
-end)
-
-return API
+-- startup ---------------------------------------------------------------------
+log("Autofarm ready - UPD 8 remote map verified against this build")
+log("First actions land within a few seconds; Farm > Stop everything halts")
+refreshLog()
+window:Notify({
+	Title = "Anime Dice Autofarm",
+	Content = "Modules are live. Farm tab has the controls, Log tab shows progress.",
+	Kind = "Success",
+	Duration = 6,
+})
+a
